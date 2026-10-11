@@ -2,13 +2,13 @@ name: RayDrop
 options:
   bundleIdPrefix: com.raydrop
   deploymentTarget:
-    iOS: "14.0"
+    iOS: "15.0"
   createIntermediateGroups: true
 targets:
   RayDrop:
     type: application
     platform: iOS
-    deploymentTarget: "14.0"
+    deploymentTarget: "15.0"
     sources:
       - path: RayDrop
         excludes:

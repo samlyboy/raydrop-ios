@@ -111,13 +111,13 @@ final class RDReceiver {
     private var listener: NWListener?
     func start() {
         do {
-            let l = try NWListener(using: .tcp, on: RD.tcpPort)
-            l.newConnectionHandler = { conn in
-                conn.start(queue: .global())
+            let l = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: RD.tcpPort))
+            l.newConnectionHandler = { (conn: NWConnection) in
+                conn.start(queue: DispatchQueue.global())
                 let stream = RDStream(conn)
                 Task { await self.handle(stream) }
             }
-            l.start(queue: .global())
+            l.start(queue: DispatchQueue.global())
             listener = l
             onStatus("接收端口已开启 :\(RD.tcpPort) · 码 \(RDStore.shared.myCode)")
         } catch {
@@ -173,14 +173,15 @@ final class RDSender {
     private var conn: NWConnection?
 
     func send(host: String, port: UInt16, files: [URL], done: @escaping (Bool) -> Void) {
-        guard let nw = NWEndpoint.Host(host), let p = NWEndpoint.Port(rawValue: port) else { return done(false) }
+        let nw = NWEndpoint.Host(host)
+        let p = NWEndpoint.Port(rawValue: port)
         let c = NWConnection(host: nw, port: p, using: .tcp)
         conn = c
         c.stateUpdateHandler = { st in
             if case .ready = st { self.doSend(files: files, done: done) }
             else if case .failed = st { self.onStatus("连接失败"); done(false) }
         }
-        c.start(queue: .global())
+        c.start(queue: DispatchQueue.global())
     }
 
     private func doSend(files: [URL], done: @escaping (Bool) -> Void) {
