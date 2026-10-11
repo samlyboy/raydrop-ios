@@ -1,0 +1,40 @@
+name: Build RayDrop iOS IPA (TrollStore)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: macos-15          # Xcode 16，支持 iOS 14+ 部署目标，自带 iphoneos SDK（arm64 真机）
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen & generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build real-device arm64 archive (no Apple cert)
+        run: |
+          xcodebuild -project RayDrop.xcodeproj -scheme RayDrop \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/RayDrop.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" archive
+
+      - name: Install ldid & fake-sign + package IPA
+        run: |
+          brew install ldid
+          bash scripts/package-ipa.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: raydrop-ipa
+          path: raydrop.ipa

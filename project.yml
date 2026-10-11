@@ -1,0 +1,28 @@
+name: RayDrop
+options:
+  bundleIdPrefix: com.raydrop
+  deploymentTarget:
+    iOS: "14.0"
+  createIntermediateGroups: true
+targets:
+  RayDrop:
+    type: application
+    platform: iOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: RayDrop
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.raydrop.ios
+        INFOPLIST_FILE: RayDrop/Info.plist
+        PRODUCT_NAME: RayDrop
+        ASSETCATALOG_APPICON_NAME: AppIcon
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_BITCODE: "NO"
+        GENERATE_INFOPLIST_FILE: "NO"
