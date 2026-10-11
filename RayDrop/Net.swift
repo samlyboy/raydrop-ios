@@ -55,8 +55,12 @@ final class RDDiscovery {
 
     func start() {
         running = true
+        sendSock = socket(AF_INET, SOCK_DGRAM, 0)
+        var yes: Int32 = 1
+        setsockopt(sendSock, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
         DispatchQueue.global().async { self.broadcastLoop() }
         DispatchQueue.global().async { self.recvLoop() }
+        DispatchQueue.global().async { self.sweepLoop() }
     }
     func stop() { running = false; if sendSock >= 0 { close(sendSock) }; if recvSock >= 0 { close(recvSock) } }
 
@@ -100,13 +104,25 @@ final class RDDiscovery {
     }
 
     private func broadcastLoop() {
-        sendSock = socket(AF_INET, SOCK_DGRAM, 0)
-        var yes: Int32 = 1
-        setsockopt(sendSock, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
         while running {
             send(to: "255.255.255.255")              // 局域网广播（可能被系统拦下，失败也无所谓）
             for ip in targets() { send(to: ip) }     // 单播兜底
             Thread.sleep(forTimeInterval: 3)
+        }
+    }
+
+    /// 子网探测（兜底）：广播发不出去时（iOS 权限限制 / 路由器丢广播），
+    /// 把同样的告知报文**单播**发给本网段每个 IP —— 对方收到任意 RayDrop 报文都会回告自己。
+    private func sweepLoop() {
+        while running {
+            var targets: [String] = []
+            for ip in RDIP.ips() where !ip.hasPrefix("100.") {
+                let parts = ip.split(separator: ".")
+                guard parts.count == 4 else { continue }
+                for h in 1...254 { targets.append("\(parts[0]).\(parts[1]).\(parts[2]).\(h)") }
+            }
+            for ip in targets { send(to: ip) }
+            Thread.sleep(forTimeInterval: 15)
         }
     }
 
@@ -160,7 +176,7 @@ final class RDDiscovery {
 final class RDReceiver {
     var onStatus: (String) -> Void = { _ in }
     var onSaved: (String, String) -> Void = { _, _ in }
-    var onStart: (Int) -> Void = { _ in }                               // 文件总数
+    var onStart: (String, Int) -> Void = { _, _ in }                    // 对端名, 文件总数
     var onProgress: (Int, Int, Int, Double) -> Void = { _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 字节/秒
     var onEnd: (Bool, String) -> Void = { _, _ in }
     private var listener: NWListener?
@@ -177,7 +193,7 @@ final class RDReceiver {
             }
             l.start(queue: DispatchQueue.global())
             listener = l
-            onStatus("接收端口已开启 :\(RD.tcpPort) · 码 \(RDStore.shared.myCode)")
+            onStatus("接收服务已开启 · 码 \(RDStore.shared.myCode)")
         } catch {
             onStatus("接收端口错误: \(error.localizedDescription)")
         }
@@ -195,18 +211,14 @@ final class RDReceiver {
             let hsLine = try await s.readLine()
             guard let hsData = hsLine.data(using: .utf8),
                   let hs = try? JSONSerialization.jsonObject(with: hsData) as? [String: Any] else { return }
-            let fromCode = hs["code"] as? String ?? ""
-            let fromName = hs["name"] as? String ?? "对方"
+            var fromName = hs["name"] as? String ?? "对方"
+            if fromName.trimmingCharacters(in: .whitespaces).isEmpty { fromName = "对方" }
             let count = hs["count"] as? Int ?? 0
 
-            guard RDStore.shared.isTrusted(fromCode) else {
-                RDWrite.line(s.conn, ["ok": false, "reason": "untrusted"])
-                onStatus("已拦截未信任的 \(fromName)(\(fromCode))")
-                return
-            }
+            // 不做信任码校验：使用者都是自己人，一律自动接收并存相册
             RDWrite.line(s.conn, ["ok": true])
             onStatus("\(fromName) 正在发送 \(count) 个文件")
-            onStart(count)
+            onStart(fromName, count)
             total = count
 
             for i in 0..<count {
@@ -261,7 +273,7 @@ final class RDReceiver {
 /// 支持暂停/继续/终止；ACK 里带 err（对方保存失败）时立刻停止并提示。
 final class RDSender {
     var onStatus: (String) -> Void = { _ in }
-    var onStart: (Int) -> Void = { _ in }
+    var onStart: (String, Int) -> Void = { _, _ in }
     var onProgress: (Int, Int, Int, Double) -> Void = { _, _, _, _ in }
     var onEnd: (Bool, String) -> Void = { _, _ in }
     private var conn: NWConnection?
@@ -279,21 +291,21 @@ final class RDSender {
         onStatus(why); onEnd(false, why); done(false)
     }
 
-    func send(host: String, port: UInt16, files: [URL], done: @escaping (Bool) -> Void) {
+    func send(host: String, port: UInt16, peerName: String, files: [URL], done: @escaping (Bool) -> Void) {
         aborted = false; paused = false; finished = false
         let nw = NWEndpoint.Host(host)
         let p = NWEndpoint.Port(rawValue: port)!
         let c = NWConnection(host: nw, port: p, using: .tcp)
         conn = c
         c.stateUpdateHandler = { (st: NWConnection.State) in
-            if case .ready = st { self.doSend(files: files, done: done) }
+            if case .ready = st { self.doSend(peer: peerName, files: files, done: done) }
             else if case .failed = st { if self.aborted { self.stop("已终止", done) } else { self.stop("连接失败", done) } }
             else if case .cancelled = st { if self.aborted && !self.finished { self.stop("已终止", done) } }
         }
         c.start(queue: DispatchQueue.global())
     }
 
-    private func doSend(files: [URL], done: @escaping (Bool) -> Void) {
+    private func doSend(peer: String, files: [URL], done: @escaping (Bool) -> Void) {
         Task {
             let s = RDStream(conn!)
             do {
@@ -306,7 +318,7 @@ final class RDSender {
                     let reason = repLine.contains("untrusted") ? "对方未信任你的码(请让对方添加你的3位码)" : "被拒绝"
                     self.stop(reason, done); s.close(); return
                 }
-                self.onStart(files.count)
+                self.onStart(peer, files.count)
 
                 for (i, url) in files.enumerated() {
                     await self.waitIfPaused()

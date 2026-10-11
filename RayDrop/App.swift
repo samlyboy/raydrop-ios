@@ -15,14 +15,15 @@ final class Engine: ObservableObject {
         var cfOnly: Bool
     }
 
+    /// 任务列表条目：header=true 是带时间戳的分隔行
+    struct LogEntry: Identifiable { let id = UUID(); let text: String; let inColor: Color; let isHeader: Bool }
+
     @Published var status = "启动中…"
-    @Published var log = ""
+    @Published var logEntries: [LogEntry] = []
     @Published var myCode = RDStore.shared.myCode
     @Published var myName = RDStore.shared.myName
-    @Published var trusted = RDStore.shared.trustedCodes
     @Published var devices: [DeviceInfo] = []
     @Published var selectedTarget: DeviceInfo?
-    @Published var myCodePending = ""
     /// 传输进度：如「(3/6) ↑上传 1.2 MB/s」；接收方向显示 ↓下载
     @Published var progress = ""
     @Published var txActive = false
@@ -31,16 +32,37 @@ final class Engine: ObservableObject {
     private let receiver = RDReceiver()
     private let discovery = RDDiscovery()
     private let sender = RDSender()
-    private var txUp = false, txTotal = 0
+    private var txUp = false, txTotal = 0, txPeer = "对方"
+
+    static let cIn = Color(red: 0.90, green: 0.22, blue: 0.21)     // 接收：红
+    static let cOut = Color(red: 0.18, green: 0.60, blue: 0.24)    // 发送：绿
+    static let cSys = Color.secondary
+
+    private static let fmtTime: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"; return f
+    }()
+    /// 新条目插在最前面（新的在上面）
+    private func addEntry(_ text: String, _ color: Color, header: Bool = false) {
+        DispatchQueue.main.async {
+            self.logEntries.insert(LogEntry(text: text, inColor: color, isHeader: header), at: 0)
+            if self.logEntries.count > 300 { self.logEntries.removeLast(self.logEntries.count - 300) }
+        }
+    }
+    private func addLog(_ text: String) { addEntry(text, Engine.cSys) }
+    /// 每轮传输插入一条带时间戳的分隔行：分 2 次传就有 2 个时间戳
+    private func addHeader(_ title: String) { addEntry(Engine.fmtTime.string(from: Date()) + "  " + title, Engine.cSys, header: true) }
 
     static func fmtSpeed(_ bps: Double) -> String {
         if bps >= 1048576 { return String(format: "%.1f MB/s", bps / 1048576) }
         return String(format: "%.0f KB/s", bps / 1024)
     }
-    private func beginTx(up: Bool, total: Int) {
+    private func beginTx(up: Bool, peer: String, total: Int) {
         DispatchQueue.main.async {
             self.txUp = up; self.txTotal = total; self.txActive = true; self.paused = false
+            let p = peer.isEmpty ? "对方" : peer
+            self.txPeer = p
             self.progress = "(0/\(max(1, total))) " + (up ? "↑上传" : "↓下载") + " 0 KB/s"
+            self.addHeader(up ? "发送 → \(p)   共 \(total) 个" : "接收 ← \(p)   共 \(total) 个")
         }
     }
     private func updateTx(cur: Int, total: Int, bps: Double) {
@@ -70,14 +92,27 @@ final class Engine: ObservableObject {
     func start() {
         receiver.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
         receiver.onSaved = { [weak self] from, name in
-            DispatchQueue.main.async { self?.log = "\(from) → 已存相册 \(name)\n" + (self?.log ?? "") }
+            // 接收：红色「一加 → 本机  003_001_xxx.jpg」
+            self?.addEntry("\(from) → 本机  \(name)", Engine.cIn)
         }
-        receiver.onStart = { [weak self] total in self?.beginTx(up: false, total: total) }
+        receiver.onStart = { [weak self] peer, total in self?.beginTx(up: false, peer: peer, total: total) }
         receiver.onProgress = { [weak self] cur, total, done, bps in self?.updateTx(cur: cur, total: total, bps: bps) }
         receiver.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         discovery.onDevice = { [weak self] o in self?.ingest(o) }
-        sender.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
-        sender.onStart = { [weak self] total in self?.beginTx(up: true, total: total) }
+        sender.onStatus = { [weak self] s in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.status = s
+                // 发送成功一个：绿色「本机 → 一加  003_001_xxx」
+                if s.hasPrefix("已发送 ") {
+                    let name = String(s.dropFirst("已发送 ".count))
+                    self.addEntry("本机 → \(self.txPeer)  \(name)", Engine.cOut)
+                } else {
+                    self.addLog(s)
+                }
+            }
+        }
+        sender.onStart = { [weak self] peer, total in self?.beginTx(up: true, peer: peer, total: total) }
         sender.onProgress = { [weak self] cur, total, done, bps in self?.updateTx(cur: cur, total: total, bps: bps) }
         sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         receiver.start(); discovery.start()
@@ -91,21 +126,8 @@ final class Engine: ObservableObject {
         if !ip.isEmpty { RDDirectory.register(code: myCode, name: myName, ip: ip, port: RD.tcpPort) }
     }
 
-    /// 每 60s：把自己注册到 CF 目录，并用「信任码」反查对方 IP；
-    /// 拿到 IP 后立刻单播告知自己 —— 即使 UDP 广播被系统拦掉（iOS 常见），双方也能互相发现。
-    private func refreshPeers() {
-        register()
-        for code in trusted {
-            RDDirectory.lookup(code: code) { [weak self] peer in
-                guard let self = self, let peer = peer, !peer.ip.isEmpty else { return }
-                DispatchQueue.main.async {
-                    self.upsert(id: "cf:" + code, code: code, name: peer.name, host: peer.ip, port: peer.port, cfOnly: true)
-                    self.discovery.announceTo([peer.ip])
-                    self.syncTargets()
-                }
-            }
-        }
-    }
+    /// 每 60s 注册自己到 CF 目录，方便对方用 3 位码查到本机
+    private func refreshPeers() { register() }
 
     private func ingest(_ o: [String: Any]) {
         guard let code = o["code"] as? String else { return }
@@ -158,8 +180,6 @@ final class Engine: ObservableObject {
         }
     }
     func setName(_ n: String) { RDStore.shared.myName = n; myName = n }
-    func addTrust() { RDStore.shared.trust(myCodePending); myCodePending = ""; trusted = RDStore.shared.trustedCodes; refreshPeers() }
-    func removeTrust(_ c: String) { RDStore.shared.untrust(c); trusted = RDStore.shared.trustedCodes }
 
     func lookup(_ code: String) {
         let c = code.trimmingCharacters(in: .whitespaces)
@@ -199,7 +219,7 @@ final class Engine: ObservableObject {
         group.notify(queue: .global()) {
             let final = urls.compactMap { $0 }
             guard !final.isEmpty else { return }
-            self.sender.send(host: dev.host, port: dev.port, files: final) { _ in completion() }
+            self.sender.send(host: dev.host, port: dev.port, peerName: dev.name, files: final) { _ in completion() }
         }
     }
     private func copyTemp(_ src: URL) -> URL {
@@ -222,17 +242,11 @@ struct ContentView: View {
                     TextField("3位数字码", text: Binding(get: { engine.myCode }, set: { engine.setCode($0) })).keyboardType(.numberPad)
                     TextField("设备名称", text: Binding(get: { engine.myName }, set: { engine.setName($0) }))
                 }
-                Section("信任码（这些码发来的文件自动接收并存相册）") {
-                    ForEach(engine.trusted, id: \.self) { c in
-                        HStack { Text(c + " (自动接收)"); Spacer(); Button("移除") { engine.removeTrust(c) }.font(.caption) }
-                    }
-                    HStack { TextField("3位数字码", text: $engine.myCodePending).keyboardType(.numberPad); Button("添加") { engine.addTrust() } }
-                }
                 Section("发现的设备") {
                     if engine.devices.isEmpty { Text("未发现").foregroundColor(.gray) }
                     ForEach(engine.devices) { d in
                         HStack {
-                            VStack(alignment: .leading) { Text(d.name + " [" + d.code + "]").font(.headline); Text("\(d.host):\(d.port)").font(.caption).foregroundColor(.gray) }
+                            VStack(alignment: .leading, spacing: 2) { Text(d.name + " [" + d.code + "]").font(.headline); Text(d.host).font(.caption).foregroundColor(.gray) }
                             Spacer()
                             Button("发送到此") { engine.selectedTarget = d; showPicker = true }.font(.caption)
                         }
@@ -254,10 +268,24 @@ struct ContentView: View {
                             Spacer()
                         }
                     }
-                    if !engine.log.isEmpty { Text(engine.log).font(.caption) }
+                    if !engine.logEntries.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(engine.logEntries) { e in
+                                if e.isHeader {
+                                    VStack(spacing: 2) {
+                                        Divider()
+                                        Text(e.text).font(.caption2).foregroundColor(.secondary)
+                                        Divider()
+                                    }
+                                } else {
+                                    Text(e.text).font(.caption).foregroundColor(e.inColor)
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            .navigationTitle("RayDrop 锐传 v6")
+            .navigationTitle("RayDrop 锐传 v7")
         }
         .sheet(isPresented: $showPicker) {
             PhotoPicker { results in
