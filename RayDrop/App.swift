@@ -198,7 +198,7 @@ struct ContentView: View {
                 }
                 Section("状态") { Text(engine.status).font(.footnote); if !engine.log.isEmpty { Text(engine.log).font(.caption) } }
             }
-            .navigationTitle("RayDrop 锐传")
+            .navigationTitle("RayDrop 锐传 v5")
         }
         .sheet(isPresented: $showPicker) {
             PhotoPicker { results in
