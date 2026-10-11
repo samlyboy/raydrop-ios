@@ -156,16 +156,23 @@ final class RDDiscovery {
 }
 
 /// TCP 接收端：握手鉴权(信任码) → 逐文件收 → 落相册 → ACK（单线程保序）
+/// 支持暂停/继续/终止；相册保存失败时把原因回给发送方（ACK 里的 err），不再假成功。
 final class RDReceiver {
     var onStatus: (String) -> Void = { _ in }
     var onSaved: (String, String) -> Void = { _, _ in }
+    var onStart: (Int) -> Void = { _ in }                               // 文件总数
+    var onProgress: (Int, Int, Int, Double) -> Void = { _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 字节/秒
+    var onEnd: (Bool, String) -> Void = { _, _ in }
     private var listener: NWListener?
+    private var current: RDStream?
+
     func start() {
         do {
             let l = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: RD.tcpPort)!)
             l.newConnectionHandler = { (conn: NWConnection) in
                 conn.start(queue: DispatchQueue.global())
                 let stream = RDStream(conn)
+                self.current = stream
                 Task { await self.handle(stream) }
             }
             l.start(queue: DispatchQueue.global())
@@ -176,11 +183,18 @@ final class RDReceiver {
         }
     }
 
+    func pause() { current?.setPaused(true) }
+    func resume() { current?.setPaused(false) }
+    func abort() { current?.close(); current = nil }
+
     private func handle(_ s: RDStream) async {
+        var total = 0
+        var saveFailed = false
+        defer { s.close(); if current === s { current = nil } }
         do {
             let hsLine = try await s.readLine()
             guard let hsData = hsLine.data(using: .utf8),
-                  let hs = try? JSONSerialization.jsonObject(with: hsData) as? [String: Any] else { s.close(); return }
+                  let hs = try? JSONSerialization.jsonObject(with: hsData) as? [String: Any] else { return }
             let fromCode = hs["code"] as? String ?? ""
             let fromName = hs["name"] as? String ?? "对方"
             let count = hs["count"] as? Int ?? 0
@@ -188,10 +202,12 @@ final class RDReceiver {
             guard RDStore.shared.isTrusted(fromCode) else {
                 RDWrite.line(s.conn, ["ok": false, "reason": "untrusted"])
                 onStatus("已拦截未信任的 \(fromName)(\(fromCode))")
-                s.close(); return
+                return
             }
             RDWrite.line(s.conn, ["ok": true])
             onStatus("\(fromName) 正在发送 \(count) 个文件")
+            onStart(count)
+            total = count
 
             for i in 0..<count {
                 let fh = try await s.readLenJSON()
@@ -201,36 +217,78 @@ final class RDReceiver {
                 let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("rd_\(UUID().uuidString)")
                 FileManager.default.createFile(atPath: tmp.path, contents: nil)
                 let handle = try FileHandle(forWritingTo: tmp)
-                try await s.readIntoFile(size, handle)
-                try? handle.close()
-                RDMediaSaver.save(tempFile: tmp, mime: mime) { ok in
-                    if ok { self.onSaved(fromName, name) }
+
+                var lastTick = Date(), lastBytes = 0, spd = 0.0
+                try await s.readIntoFile(size, handle) { done in
+                    let now = Date()
+                    let dt = now.timeIntervalSince(lastTick)
+                    if dt >= 0.2 {
+                        spd = Double(done - lastBytes) / dt
+                        lastTick = now; lastBytes = done
+                        self.onProgress(i + 1, total, done, spd)
+                    }
                 }
-                RDWrite.line(s.conn, ["ack": i])   // 收完才放行下一个
+                try? handle.close()
+
+                // 必须等相册保存结果再回 ACK，否则发送端会显示"发送成功"而相册里没有
+                let res: (Bool, String) = await withCheckedContinuation { cont in
+                    RDMediaSaver.save(tempFile: tmp, name: name, mime: mime) { ok, err in
+                        cont.resume(returning: (ok, err))
+                    }
+                }
+                var ack: [String: Any] = ["ack": i]
+                if res.0 {
+                    onSaved(fromName, name)
+                } else {
+                    saveFailed = true
+                    ack["err"] = "保存到相册失败：\(res.1)"
+                    onStatus("保存失败：\(name)（\(res.1)）")
+                }
+                RDWrite.line(s.conn, ack)   // 收完才放行下一个
             }
             _ = try? await s.readLine()   // done
             RDWrite.line(s.conn, ["ok": true, "bye": true])
-            onStatus("接收完成：\(fromName)")
+            onStatus(saveFailed ? "接收结束（部分文件未保存）" : "接收完成：\(fromName)")
+            onEnd(!saveFailed, saveFailed ? "部分文件保存失败" : "接收完成")
         } catch {
             onStatus("接收中断")
+            onEnd(false, "接收中断")
         }
-        s.close()
     }
 }
 
 /// TCP 发送端：连接 → 握手 → 逐文件发(等 ACK，单线程保序) → 结束
+/// 支持暂停/继续/终止；ACK 里带 err（对方保存失败）时立刻停止并提示。
 final class RDSender {
     var onStatus: (String) -> Void = { _ in }
+    var onStart: (Int) -> Void = { _ in }
+    var onProgress: (Int, Int, Int, Double) -> Void = { _, _, _, _ in }
+    var onEnd: (Bool, String) -> Void = { _, _ in }
     private var conn: NWConnection?
+    private var paused = false, aborted = false, finished = false
+
+    func pause() { paused = true }
+    func resume() { paused = false }
+    func abort() { aborted = true; paused = false; conn?.cancel() }
+
+    private func waitIfPaused() async {
+        while paused && !aborted { try? await Task.sleep(nanoseconds: 120_000_000) }
+    }
+    private func stop(_ why: String, _ done: @escaping (Bool) -> Void) {
+        finished = true
+        onStatus(why); onEnd(false, why); done(false)
+    }
 
     func send(host: String, port: UInt16, files: [URL], done: @escaping (Bool) -> Void) {
+        aborted = false; paused = false; finished = false
         let nw = NWEndpoint.Host(host)
         let p = NWEndpoint.Port(rawValue: port)!
         let c = NWConnection(host: nw, port: p, using: .tcp)
         conn = c
         c.stateUpdateHandler = { (st: NWConnection.State) in
             if case .ready = st { self.doSend(files: files, done: done) }
-            else if case .failed = st { self.onStatus("连接失败"); done(false) }
+            else if case .failed = st { if self.aborted { self.stop("已终止", done) } else { self.stop("连接失败", done) } }
+            else if case .cancelled = st { if self.aborted && !self.finished { self.stop("已终止", done) } }
         }
         c.start(queue: DispatchQueue.global())
     }
@@ -246,32 +304,51 @@ final class RDSender {
                       let rep = try? JSONSerialization.jsonObject(with: repData) as? [String: Any],
                       (rep["ok"] as? Bool) == true else {
                     let reason = repLine.contains("untrusted") ? "对方未信任你的码(请让对方添加你的3位码)" : "被拒绝"
-                    self.onStatus(reason); done(false); s.close(); return
+                    self.stop(reason, done); s.close(); return
                 }
+                self.onStart(files.count)
+
                 for (i, url) in files.enumerated() {
+                    await self.waitIfPaused()
+                    if self.aborted { self.stop("已终止", done); s.close(); return }
                     let name = String(format: "%03d_", i + 1) + url.lastPathComponent
                     let mime = RD.mime(for: url.lastPathComponent)
                     let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
                     let size = (attrs[.size] as? Int) ?? 0
                     RDWrite.lenJSON(conn!, ["name": name, "size": size, "mime": mime, "index": i, "total": files.count])
                     let handle = try FileHandle(forReadingFrom: url)
-                    var off = 0
+                    var off = 0, lastTick = Date(), lastB = 0, spd = 0.0
                     while off < size {
+                        await self.waitIfPaused()
+                        if self.aborted { try? handle.close(); self.stop("已终止", done); s.close(); return }
                         let chunk = handle.readData(ofLength: RD.chunkSize)
                         if chunk.isEmpty { break }
-                        try await sendChunk(chunk)   // 背压：等这块发完再发下一块
+                        try await self.sendChunk(chunk)   // 背压：等这块发完再发下一块
                         off += chunk.count
+                        let now = Date(); let dt = now.timeIntervalSince(lastTick)
+                        if dt >= 0.2 {
+                            spd = Double(off - lastB) / dt
+                            lastTick = now; lastB = off
+                            self.onProgress(i + 1, files.count, off, spd)
+                        }
                     }
                     try? handle.close()
-                    _ = try await s.readLine()   // ACK：收完才发下一个
+                    let ackLine = try await s.readLine()   // ACK：收完才发下一个
+                    if let d = ackLine.data(using: .utf8),
+                       let a = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                       let e = a["err"] as? String {
+                        self.stop("对方保存失败：\(e)", done); s.close(); return
+                    }
                     self.onStatus("已发送 \(name)")
                 }
                 RDWrite.line(conn!, ["done": true])
                 _ = try? await s.readLine()
+                self.finished = true
                 self.onStatus("发送完成：\(files.count) 个文件")
+                self.onEnd(true, "发送完成")
                 done(true)
             } catch {
-                self.onStatus("发送失败"); done(false)
+                if self.aborted { self.stop("已终止", done) } else { self.stop("发送失败", done) }
             }
             s.close()
         }

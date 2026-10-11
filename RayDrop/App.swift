@@ -23,18 +23,63 @@ final class Engine: ObservableObject {
     @Published var devices: [DeviceInfo] = []
     @Published var selectedTarget: DeviceInfo?
     @Published var myCodePending = ""
+    /// 传输进度：如「(3/6) ↑上传 1.2 MB/s」；接收方向显示 ↓下载
+    @Published var progress = ""
+    @Published var txActive = false
+    @Published var paused = false
 
     private let receiver = RDReceiver()
     private let discovery = RDDiscovery()
     private let sender = RDSender()
+    private var txUp = false, txTotal = 0
+
+    static func fmtSpeed(_ bps: Double) -> String {
+        if bps >= 1048576 { return String(format: "%.1f MB/s", bps / 1048576) }
+        return String(format: "%.0f KB/s", bps / 1024)
+    }
+    private func beginTx(up: Bool, total: Int) {
+        DispatchQueue.main.async {
+            self.txUp = up; self.txTotal = total; self.txActive = true; self.paused = false
+            self.progress = "(0/\(max(1, total))) " + (up ? "↑上传" : "↓下载") + " 0 KB/s"
+        }
+    }
+    private func updateTx(cur: Int, total: Int, bps: Double) {
+        DispatchQueue.main.async {
+            let t = total > 0 ? total : self.txTotal
+            guard t > 0 else { return }
+            self.progress = "(\(min(max(1, cur), t))/\(t)) " + (self.txUp ? "↑上传" : "↓下载") + " " + Engine.fmtSpeed(bps)
+        }
+    }
+    private func endTx(ok: Bool, msg: String) {
+        DispatchQueue.main.async {
+            self.txActive = false; self.paused = false
+            if ok && self.txTotal > 0 { self.progress = "(\(self.txTotal)/\(self.txTotal)) 完成" }
+            else if msg != "接收中断" && !msg.hasPrefix("已终止") { self.progress = "" }
+        }
+    }
+    func togglePause() {
+        paused.toggle()
+        if txUp { paused ? sender.pause() : sender.resume() }
+        else { paused ? receiver.pause() : receiver.resume() }
+    }
+    func abortTx() {
+        if txUp { sender.abort() } else { receiver.abort() }
+        txActive = false; paused = false; progress = ""
+    }
 
     func start() {
         receiver.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
         receiver.onSaved = { [weak self] from, name in
             DispatchQueue.main.async { self?.log = "\(from) → 已存相册 \(name)\n" + (self?.log ?? "") }
         }
+        receiver.onStart = { [weak self] total in self?.beginTx(up: false, total: total) }
+        receiver.onProgress = { [weak self] cur, total, done, bps in self?.updateTx(cur: cur, total: total, bps: bps) }
+        receiver.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         discovery.onDevice = { [weak self] o in self?.ingest(o) }
         sender.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
+        sender.onStart = { [weak self] total in self?.beginTx(up: true, total: total) }
+        sender.onProgress = { [weak self] cur, total, done, bps in self?.updateTx(cur: cur, total: total, bps: bps) }
+        sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         receiver.start(); discovery.start()
         refreshPeers()
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshPeers() }
@@ -196,9 +241,23 @@ struct ContentView: View {
                 Section("通过 3 位码查找 Tailscale 设备") {
                     HStack { TextField("3位数字码", text: $lookupCode).keyboardType(.numberPad); Button("查找") { engine.lookup(lookupCode) } }
                 }
-                Section("状态") { Text(engine.status).font(.footnote); if !engine.log.isEmpty { Text(engine.log).font(.caption) } }
+                Section("状态") {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(engine.status).font(.footnote)
+                        Spacer(minLength: 8)
+                        if !engine.progress.isEmpty { Text(engine.progress).font(.footnote).foregroundColor(.secondary) }
+                    }
+                    if engine.txActive {
+                        HStack {
+                            Button(engine.paused ? "继续" : "暂停") { engine.togglePause() }.buttonStyle(.bordered)
+                            Button("终止", role: .destructive) { engine.abortTx() }.buttonStyle(.bordered)
+                            Spacer()
+                        }
+                    }
+                    if !engine.log.isEmpty { Text(engine.log).font(.caption) }
+                }
             }
-            .navigationTitle("RayDrop 锐传 v5")
+            .navigationTitle("RayDrop 锐传 v6")
         }
         .sheet(isPresented: $showPicker) {
             PhotoPicker { results in
