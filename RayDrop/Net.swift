@@ -31,7 +31,9 @@ enum RDIP {
         }
         return out
     }
-    static func tailscaleIP() -> String { ips().first(where: { $0.hasPrefix("100.") }) ?? "" }
+    /// 优先 Tailscale 100.x；没有 Tailscale 时退回局域网 IP —— 否则本机不会注册到 CF 目录，
+    /// 对端就永远查不到我（信任码反向发现通道失效）。
+    static func tailscaleIP() -> String { ips().first(where: { $0.hasPrefix("100.") }) ?? ips().first ?? "" }
 }
 
 /// 局域网 UDP 发现：广播 + 单播双通道。
