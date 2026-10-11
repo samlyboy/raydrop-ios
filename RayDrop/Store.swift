@@ -19,6 +19,16 @@ final class RDStore {
     }
     private func deviceNameDefault() -> String { "我的iPhone" }
 
+    /// 稳定设备标识（UUID，装一次只生成一次）。
+    /// 3 位码允许用户随时改，改完对端就会多出一条；用 did 去重可保证一台设备只显示一条。
+    var deviceId: String {
+        get {
+            if let v = d.string(forKey: "did"), v.count > 8 { return v }
+            let v = UUID().uuidString
+            d.set(v, forKey: "did"); return v
+        }
+    }
+
     var trustedCodes: [String] {
         get { (d.stringArray(forKey: "trusted") ?? []).sorted() }
         set { d.set(newValue, forKey: "trusted") }

@@ -4,7 +4,16 @@ import PhotosUI
 import UniformTypeIdentifiers
 
 final class Engine: ObservableObject {
-    struct DeviceInfo: Identifiable { let id = UUID(); let code: String; let name: String; let host: String; let port: UInt16 }
+    /// 设备记录：id 用稳定标识（did）而不是 3 位码 —— 对方改了码也还是同一台设备，不会多出一条
+    struct DeviceInfo: Identifiable {
+        var id: String
+        var code: String
+        var name: String
+        var host: String
+        var port: UInt16
+        var lastSeen: Date
+        var cfOnly: Bool
+    }
 
     @Published var status = "启动中…"
     @Published var log = ""
@@ -13,6 +22,7 @@ final class Engine: ObservableObject {
     @Published var trusted = RDStore.shared.trustedCodes
     @Published var devices: [DeviceInfo] = []
     @Published var selectedTarget: DeviceInfo?
+    @Published var myCodePending = ""
 
     private let receiver = RDReceiver()
     private let discovery = RDDiscovery()
@@ -26,8 +36,9 @@ final class Engine: ObservableObject {
         discovery.onDevice = { [weak self] o in self?.ingest(o) }
         sender.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
         receiver.start(); discovery.start()
-        register()
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.register() }
+        refreshPeers()
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshPeers() }
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.cull() }
     }
 
     private func register() {
@@ -35,30 +46,86 @@ final class Engine: ObservableObject {
         if !ip.isEmpty { RDDirectory.register(code: myCode, name: myName, ip: ip, port: RD.tcpPort) }
     }
 
+    /// 每 60s：把自己注册到 CF 目录，并用「信任码」反查对方 IP；
+    /// 拿到 IP 后立刻单播告知自己 —— 即使 UDP 广播被系统拦掉（iOS 常见），双方也能互相发现。
+    private func refreshPeers() {
+        register()
+        for code in trusted {
+            RDDirectory.lookup(code: code) { [weak self] peer in
+                guard let self = self, let peer = peer, !peer.ip.isEmpty else { return }
+                DispatchQueue.main.async {
+                    self.upsert(id: "cf:" + code, code: code, name: peer.name, host: peer.ip, port: peer.port, cfOnly: true)
+                    self.discovery.announceTo([peer.ip])
+                    self.syncTargets()
+                }
+            }
+        }
+    }
+
     private func ingest(_ o: [String: Any]) {
         guard let code = o["code"] as? String else { return }
         let name = o["name"] as? String ?? "设备"
         let ips = o["ips"] as? [String] ?? []
         let port = UInt16((o["port"] as? NSNumber)?.intValue ?? Int(RD.tcpPort))
-        let host = ips.first(where: { $0.hasPrefix("100.") }) ?? ips.first ?? ""
-        if let i = devices.firstIndex(where: { $0.code == code }) { devices[i] = DeviceInfo(code: code, name: name, host: host, port: port) }
-        else { devices.append(DeviceInfo(code: code, name: name, host: host, port: port)) }
+        let host = ips.first(where: { $0.hasPrefix("100.") }) ?? ips.first ?? (o["srcIP"] as? String ?? "")
+        let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
+        upsert(id: did, code: code, name: name, host: host, port: port, cfOnly: false)
+        discovery.announceTo(host.isEmpty ? [] : [host])   // 收到就回告一次，对方立刻能看到我
+        syncTargets()
     }
 
-    func setCode(_ c: String) { let c = c.trimmingCharacters(in: .whitespaces); if c.count == 3 && c.allSatisfy(\.isNumber) { RDStore.shared.myCode = c; myCode = c; register() } }
+    /// 合并规则：did → 3位码 → 同名同 IP（对方改码后仍视为同一台设备）
+    private func upsert(id: String, code: String, name: String, host: String, port: UInt16, cfOnly: Bool) {
+        var idx = devices.firstIndex { $0.id == id }
+        if idx == nil { idx = devices.firstIndex { $0.code == code } }
+        if idx == nil, !host.isEmpty { idx = devices.firstIndex { $0.name == name && $0.host == host } }
+        if let i = idx {
+            if !id.hasPrefix("cf:") { devices[i].id = id }     // 真 did 优先于 cf:code
+            devices[i].code = code
+            devices[i].name = name
+            if !host.isEmpty { devices[i].host = host }
+            devices[i].port = port
+            devices[i].lastSeen = Date()
+            if !cfOnly { devices[i].cfOnly = false }
+        } else {
+            devices.append(DeviceInfo(id: id, code: code, name: name, host: host, port: port, lastSeen: Date(), cfOnly: cfOnly))
+        }
+    }
+
+    private func syncTargets() { discovery.setExtraTargets(devices.map { $0.host }.filter { !$0.isEmpty }) }
+
+    /// 清理：局域网设备 45s 没消息就下线；CF 目录设备 10 分钟后过期。
+    /// 没有这一步，对方改码/重启后旧条目会永远留在列表里（就是之前出现两条的原因之一）。
+    private func cull() {
+        let now = Date()
+        var kept = devices.filter { now.timeIntervalSince($0.lastSeen) < ($0.cfOnly ? 600 : 45) }
+        let direct = kept.filter { !$0.cfOnly }
+        if !direct.isEmpty { kept = kept.filter { d in !d.cfOnly || !direct.contains { $0.code == d.code } } }
+        if kept.count != devices.count { devices = kept; syncTargets() }
+    }
+
+    func setCode(_ c: String) {
+        let c = c.trimmingCharacters(in: .whitespaces)
+        if c.count == 3 && c.allSatisfy(\.isNumber) {
+            RDStore.shared.myCode = c; myCode = c
+            register()
+            discovery.announceTo(devices.map { $0.host }.filter { !$0.isEmpty })
+        }
+    }
     func setName(_ n: String) { RDStore.shared.myName = n; myName = n }
-    func addTrust() { RDStore.shared.trust(myCodePending); myCodePending = ""; trusted = RDStore.shared.trustedCodes }
+    func addTrust() { RDStore.shared.trust(myCodePending); myCodePending = ""; trusted = RDStore.shared.trustedCodes; refreshPeers() }
     func removeTrust(_ c: String) { RDStore.shared.untrust(c); trusted = RDStore.shared.trustedCodes }
-    @Published var myCodePending = ""
 
     func lookup(_ code: String) {
         let c = code.trimmingCharacters(in: .whitespaces)
         guard c.count == 3 else { return }
-        RDDirectory.lookup(code: c) { peer in
+        RDDirectory.lookup(code: c) { [weak self] peer in
+            guard let self = self else { return }
             DispatchQueue.main.async {
-                if let peer = peer {
-                    if let i = self.devices.firstIndex(where: { $0.code == c }) { self.devices[i] = DeviceInfo(code: c, name: peer.name, host: peer.ip, port: peer.port) }
-                    else { self.devices.append(DeviceInfo(code: c, name: peer.name, host: peer.ip, port: peer.port)) }
+                if let peer = peer, !peer.ip.isEmpty {
+                    self.upsert(id: "cf:" + c, code: c, name: peer.name, host: peer.ip, port: peer.port, cfOnly: true)
+                    self.discovery.announceTo([peer.ip])
+                    self.syncTargets()
                     self.status = "已找到 \(peer.name)"
                 } else { self.status = "未找到该码的在线设备" }
             }
