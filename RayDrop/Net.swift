@@ -111,7 +111,7 @@ final class RDReceiver {
     private var listener: NWListener?
     func start() {
         do {
-            let l = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: RD.tcpPort))
+            let l = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: RD.tcpPort)!)
             l.newConnectionHandler = { (conn: NWConnection) in
                 conn.start(queue: DispatchQueue.global())
                 let stream = RDStream(conn)
@@ -174,10 +174,10 @@ final class RDSender {
 
     func send(host: String, port: UInt16, files: [URL], done: @escaping (Bool) -> Void) {
         let nw = NWEndpoint.Host(host)
-        let p = NWEndpoint.Port(rawValue: port)
+        let p = NWEndpoint.Port(rawValue: port)!
         let c = NWConnection(host: nw, port: p, using: .tcp)
         conn = c
-        c.stateUpdateHandler = { st in
+        c.stateUpdateHandler = { (st: NWConnection.State) in
             if case .ready = st { self.doSend(files: files, done: done) }
             else if case .failed = st { self.onStatus("连接失败"); done(false) }
         }
