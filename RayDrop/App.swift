@@ -168,35 +168,28 @@ final class Engine: ObservableObject {
         let ips = o["ips"] as? [String] ?? []
         let port = UInt16((o["port"] as? NSNumber)?.intValue ?? Int(RD.tcpPort))
 
-        // 按「本机是否具备该通道」+「是否与对端同网段」过滤，只显示真能连上的地址：
-        // ① 本机没有 Tailscale(100.x) → 不显示对方的 Tailscale 地址（连了也传不了）
-        // ② 对方局域网地址与本机不同 /24 → 不显示局域网地址（不在同一局域网）
         let myIPs = RDIP.ips()
         let myHasTS = myIPs.contains { $0.hasPrefix("100.") }
-        var peerLan = "", peerTS = ""
-        for ip in ips {
-            if ip.hasPrefix("100.") { if peerTS.isEmpty { peerTS = ip } }
-            else if peerLan.isEmpty { peerLan = ip }
-        }
         let src = o["srcIP"] as? String ?? ""
-        if !src.isEmpty {
-            if src.hasPrefix("100.") { peerTS = src }
-            else if peerLan.isEmpty || !Engine.sameSubnet(src, myIPs) { peerLan = src }
-        }
-        // 过滤：局域网要同网段；Tailscale 要本机也有
-        var lan = ""
-        if !peerLan.isEmpty && Engine.sameSubnet(peerLan, myIPs) { lan = peerLan }
-        var ts = ""
-        if myHasTS && !peerTS.isEmpty { ts = peerTS }
-        // 兜底：报文来源一定可达（同网段且是真实来源），优先用它做局域网通道
-        if lan.isEmpty && !src.isEmpty && !src.hasPrefix("100.") && Engine.sameSubnet(src, myIPs) { lan = src }
-        // 两边都没有可用通道时，至少保留原始快照，保证用户能看到设备（但会标注不可连）
-        if lan.isEmpty && ts.isEmpty {
-            lan = peerLan; ts = peerTS
-        }
-        // ★ 设备若可通过 Tailscale 到达，则只用 Tailscale 地址：对端自报的局域网地址多为
-        //   其另一物理网络的 192.168.1.x（与本机恰巧同名 /24 但不可达），既连不通又会在列表制造重复条目。
-        if !ts.isEmpty { lan = "" }
+
+        // ★ 关键判据（锐哥修正）：LAN 地址只有「包从真实局域网到达」(src 非 100.x 且与本机同 /24) 才可信。
+        //   从 Tailscale 包里对端自报的局域网地址(其自己另一物理网络的 192.168.1.x)即使恰巧同 /24，
+        //   也只是"假同局域网"——物理不互通、连不通，必须丢弃，只保留 Tailscale。
+        //   真同局域网的设备会同时收到它的 LAN 包 + TS 包，于是 LAN 与 TS 两条都保留（正是要的效果）。
+        let viaLan = !src.isEmpty && !src.hasPrefix("100.") && Engine.sameSubnet(src, myIPs)
+
+        // TS 地址：仅取载荷 ips 里的 100.x（本机有 TS 才能用）
+        var peerTS = ""
+        for ip in ips where ip.hasPrefix("100.") { peerTS = ip; break }
+        if src.hasPrefix("100.") { peerTS = src }   // 从 TS 到达，源即 TS 地址
+
+        // LAN 地址：仅当包从真实局域网到达，源地址即真同网段邻居
+        let peerLan = viaLan ? src : ""
+
+        var lan = peerLan
+        var ts = (myHasTS && !peerTS.isEmpty) ? peerTS : ""
+        // 兜底：两个都空时仍保留快照，保证可见
+        if lan.isEmpty && ts.isEmpty { lan = peerLan; ts = peerTS }
 
         let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
         upsert(id: did, code: code, name: name, platform: platform, lanHost: lan, tsHost: ts, port: port)
@@ -221,7 +214,10 @@ final class Engine: ObservableObject {
         if let i = idx {
             devices[i].id = id.hasPrefix("cf:") ? devices[i].id : id
             devices[i].code = code; devices[i].name = name; devices[i].platform = platform
-            devices[i].lanHost = lanHost; devices[i].tsHost = tsHost; devices[i].port = port; devices[i].lastSeen = Date()
+            // ★ 只覆盖非空地址：TS 包到达时 lanHost 为空，不能把刚收到的真 LAN 地址清掉
+            if !lanHost.isEmpty { devices[i].lanHost = lanHost }
+            if !tsHost.isEmpty { devices[i].tsHost = tsHost }
+            devices[i].port = port; devices[i].lastSeen = Date()
         } else {
             devices.append(DeviceInfo(id: id, code: code, name: name, platform: platform, lanHost: lanHost, tsHost: tsHost, port: port, lastSeen: Date()))
         }
