@@ -558,7 +558,7 @@ struct NameEditSheet: View {
 /// 分享进来的文件：App 被唤起时列出，选设备即可发送
 struct ShareInboxSheet: View {
     @ObservedObject var engine: Engine
-    @Environment(\.presentationMode) var pm
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationView {
@@ -598,7 +598,7 @@ struct ShareInboxSheet: View {
                 HStack {
                     Button("清空") { engine.clearShared() }.padding(.horizontal, 6)
                     Spacer()
-                    Button("关闭") { pm.dismiss() }.buttonStyle(.borderedProminent)
+                    Button("关闭") { dismiss() }.buttonStyle(.borderedProminent)
                 }
                 .padding(10)
             }

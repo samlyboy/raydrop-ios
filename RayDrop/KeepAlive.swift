@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import UIKit
 
 /// 后台保活：iOS 只允许在声明的后台模式里继续执行代码。声明 `audio` 后，用一个
 /// 静音循环音频会话把进程挂在后台，从而让 UDP 发现 + TCP 接收服务持续运行。
@@ -85,7 +86,7 @@ final class RDKeepAlive: NSObject, AVAudioPlayerDelegate
     }
 }
 
-/// App 委托：负责启动保活并在进入后台/回前台时通知引擎
+/// App 委托：负责启动保活并在分享扩展唤起时通知主界面
 final class RDAppDelegate: NSObject, UIApplicationDelegate
 {
     func application(_ application: UIApplication,
