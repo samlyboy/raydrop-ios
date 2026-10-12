@@ -6,14 +6,16 @@ APP="build/RayDrop.xcarchive/Products/Applications/RayDrop.app"
 [ -d "$APP" ] || { echo "RayDrop.app not found at $APP"; exit 1; }
 
 # ---------- 1) 先把分享扩展嵌进 .app 的 PlugIns 目录 ----------
-# xcodegen 的 app-extension target 会被 archive 成独立的 RayDropShare.appex，
-# 需要手动拷进宿主 .app/PlugIns/，TrollStore 安装时才会认这个分享扩展。
-APP_SHARE="$(find build -type d -name 'RayDropShare.appex' 2>/dev/null | head -1)"
+# CI 用独立 scheme 构建 RayDropShare.appex（主 app 的 archive 不会自动带上它）
+APP_SHARE=""
+for cand in $(find build -type d -name 'RayDropShare.appex' 2>/dev/null); do
+  APP_SHARE="$cand"; break
+done
 if [ -n "$APP_SHARE" ]; then
   mkdir -p "$APP/PlugIns"
   rm -rf "$APP/PlugIns/RayDropShare.appex"
   cp -R "$APP_SHARE" "$APP/PlugIns/"
-  echo "=== embedded share extension: $APP_SHARE ==="
+  echo "=== embedded share extension from: $APP_SHARE ==="
 else
   echo "WARN: RayDropShare.appex not found — 分享扩展不会被包含"
 fi
