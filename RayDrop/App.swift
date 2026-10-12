@@ -395,16 +395,16 @@ struct KindButton: View {
 struct TextInputSheet: View {
     @Binding var text: String
     let onSend: (String) -> Void
-    @Environment(\.presentationMode) var pm
+    @Environment(\.dismiss) private var dismiss
     var body: some View {
         NavigationView {
             TextEditor(text: $text).padding(6).frame(maxWidth: .infinity, maxHeight: .infinity)
                 .navigationTitle("输入要发送的文本").navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .cancellationAction) { Button("取消") { pm.dismiss() } }
+                    ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("确定") {
-                            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { onSend(text) } else { pm.dismiss() }
+                            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { onSend(text) } else { dismiss() }
                         }
                     }
                 }
