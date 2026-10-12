@@ -235,8 +235,6 @@ struct ContentView: View {
     @State var showDoc = false
     @State var showText = false
     @State var textDraft = ""
-    @State var editCode = false
-    @State var editCodeDraft = ""
     @State var editName = false
     @State var editNameDraft = ""
 
@@ -277,11 +275,6 @@ struct ContentView: View {
             Button("复制") { UIPasteboard.general.string = engine.receivedText }
             Button("关闭", role: .cancel) {}
         } message: { Text(engine.receivedText) }
-        .alert("修改3位码", isPresented: $editCode) {
-            TextField("3位数字", text: $editCodeDraft).keyboardType(.numberPad)
-            Button("取消", role: .cancel) {}
-            Button("确认") { engine.setCode(editCodeDraft) }
-        }
         .alert("设备名称", isPresented: $editName) {
             TextField("设备名称", text: $editNameDraft)
             Button("取消", role: .cancel) {}
@@ -293,28 +286,35 @@ struct ContentView: View {
         .onAppear { engine.start() }
     }
 
+    /// 只保留设备名称：前缀加粗大字体，点一下直接编辑（不再显示 3 位码与铅笔图标）
     private var header: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        Button {
+            editNameDraft = engine.myName
+            editName = true
+        } label: {
             HStack(spacing: 4) {
-                Text(engine.myCode).font(.title3.monospacedDigit().weight(.bold))
-                pencil { editCodeDraft = engine.myCode; editCode = true }
+                Text("设备名称：").font(.headline)
+                Text(engine.myName).font(.title3.weight(.bold))
                 Spacer()
             }
-            HStack(spacing: 4) {
-                Text(engine.myName).font(.subheadline)
-                pencil { editNameDraft = engine.myName; editName = true }
-                Spacer()
-            }
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .padding(.horizontal).padding(.top, 4)
     }
-    private func pencil(_ action: @escaping () -> Void) -> some View {
-        Button(action: action) { Image(systemName: "pencil").font(.caption) }
-            .buttonStyle(.plain).foregroundColor(.secondary)
-    }
-    /// 快速打开系统「文件」App，免去退出到桌面再找
+    /// 快速打开系统「文件」App：shareddocuments 能直达「我的 iPhone」；失败依次回退
     private func openFiles() {
-        if let u = URL(string: "file://") { UIApplication.shared.open(u) }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let candidates: [URL] = [
+            URL(string: "shareddocuments://")!,
+            docs,
+            URL(fileURLWithPath: NSHomeDirectory()),
+            URL(string: "file://")!
+        ]
+        for u in candidates where UIApplication.shared.canOpenURL(u) {
+            UIApplication.shared.open(u, options: [:], completionHandler: nil)
+            return
+        }
     }
 
     private var kindBar: some View {
