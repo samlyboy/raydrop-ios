@@ -2,21 +2,29 @@ import Foundation
 import Network
 import Darwin
 
-/// 枚举本机 IP。**根治"幽灵 IP"**：只上报当前 Wi-Fi 主接口(en0)的局域网地址 + Tailscale(100.x)。/// iOS 有多个虚拟接口（蜂窝 pdp_ip0、VPN ipsec/utun、点对点 awdl/llw、热点 bridge、隧道 gif/stf），
-/// 它们的 IPv4（如蜂窝/VPN 的 10.x）不是当前局域网可达地址——一旦上报给对端，会让对端的
-/// 「局域网 IP」在真实地址与幽灵地址间反复跳变，点到幽灵地址就连不通。
-/// 去掉发送端为排序加的 "%03d_" 序号前缀（"001_1.apk" → "1.apk"），
-/// 真实以序号开头的文件（如 "3gp_素材.mp4"）不受影响。
-func stripOrderPrefix(_ name: String) -> String {
-    let parts = name.split(separator: " ", maxSplits: 1).map(String.init)
-    // 去掉前缀后仍需带扩展名，避免把无扩展名文件误判
-    if parts.count == 2 {
-        let tail = parts[1]
-        if (tail as NSString).pathExtension.isEmpty == false { return tail }
+extension RD {
+    /// 去掉发送端为排序加的 "%03d_" 序号前缀（"001_1.apk" → "1.apk"）。
+    /// 要求去掉前缀后仍有扩展名，避免把真实以序号命名的文件误判。
+    static func stripOrderPrefix(_ name: String) -> String {
+        guard name.count > 4, let num = Int(name.prefix(3)), name.hasPrefix(String(format: "%03d_", num)) else { return name }
+        let tail = String(name.dropFirst(4))
+        if (tail as NSString).pathExtension.isEmpty { return name }
+        return tail
     }
-    return name
+
+    /// 生成一个带真实文件名的临时文件 URL（保留扩展名，导出到「文件」App 时名字才对）
+    static func tempURL(named name: String) -> URL {
+        let safe = (name as NSString).lastPathComponent
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("raydrop_\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(safe)
+    }
 }
 
+/// 枚举本机 IP。**根治"幽灵 IP"**：只上报当前 Wi-Fi 主接口(en0)的局域网地址 + Tailscale(100.x)。
+/// iOS 有多个虚拟接口（蜂窝 pdp_ip0、VPN ipsec/utun、点对点 awdl/llw、热点 bridge、隧道 gif/stf），
+/// 它们的 IPv4（如蜂窝/VPN 的 10.x）不是当前局域网可达地址——一旦上报给对端，会让对端的
+/// 「局域网 IP」在真实地址与幽灵地址间反复跳变，点到幽灵地址就连不通。
 enum RDIP {
     static func ips() -> [String] {
         // 先收集所有非 lo0 的 IPv4：(接口名, IP)
