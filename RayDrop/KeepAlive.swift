@@ -86,24 +86,39 @@ final class RDKeepAlive: NSObject, AVAudioPlayerDelegate
     }
 }
 
-/// App 委托：负责启动保活并在分享扩展唤起时通知主界面
+/// App 委托：负责启动保活、监听分享扩展的通知、唤醒主界面处理分享
 final class RDAppDelegate: NSObject, UIApplicationDelegate
 {
+    private var shareObserver: Any?
+
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool
     {
         RDKeepAlive.shared.start()
+        listenForShare()
         return true
+    }
+
+    /// 分享扩展通过 Darwin 通知告知"inbox 里有新文件"；主 APP 在前台或后台都会收到
+    private func listenForShare()
+    {
+        let name = "com.raydrop.ios.sharedItemsAdded" as CFString
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            Unmanaged.passUnretained(self).toOpaque(),
+            { _, _, _, _, _ in
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .rdAppShouldScanInbox, object: nil)
+                }
+            },
+            name, nil, .deliverImmediately)
     }
 
     /// 分享扩展用 URL scheme 唤起主 APP
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool
     {
-        NotificationCenter.default.post(name: .rdOpenURL, object: nil)
+        NotificationCenter.default.post(name: .rdAppShouldScanInbox, object: nil)
         return true
     }
 }
-
-extension Notification.Name { static let rdOpenURL = Notification.Name("rdOpenURL") }
-extension Notification.Name { static let rdDidEnterBackground = Notification.Name("rdDidEnterBackground") }

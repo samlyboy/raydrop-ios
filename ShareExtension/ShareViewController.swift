@@ -125,11 +125,16 @@ final class ShareViewController: UIViewController
             return
         }
         statusLabel.text = "已准备 \(count) 项，正在打开 RayDrop…"
-        // 唤起主 APP：把文件交给它选设备发送
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            guard let self else { return }
-            if let url = URL(string: "raydrop://shared") { UIApplication.shared.open(url) }
-            self.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+        // 扩展里不能调 UIApplication.shared（iOS 会拒绝编译），也拉不起主 APP。
+        // 做法：只把文件放进 App Group 的 inbox，然后关闭扩展；
+        // 主 APP 在 onAppear / 回前台 / 收到 Darwin 通知时扫描 inbox 并弹设备列表。
+        // 用 CFNotificationCenter 通知主 APP（主 APP 已在后台时也能被唤醒）。
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            CFNotificationName("com.raydrop.ios.sharedItemsAdded" as CFString),
+            nil, nil, true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
         }
     }
 }
