@@ -523,7 +523,7 @@ struct ContentView: View {
                 Image(systemName: d.isComputer ? "desktopcomputer" : "iphone")
                     .font(.title3).frame(width: 28)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("\(d.name) [\(d.code)]").font(.subheadline.weight(.medium))
+                    Text("\(d.name)").font(.subheadline.weight(.medium))
                     Text(host).font(.caption2).foregroundColor(.secondary)
                 }
                 Spacer()
@@ -694,7 +694,7 @@ struct ShareInboxSheet: View {
             HStack(spacing: 10) {
                 Image(systemName: d.isComputer ? "desktopcomputer" : "iphone").font(.title3).frame(width: 28)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("\(d.name) [\(d.code)]").font(.subheadline.weight(.medium))
+                    Text("\(d.name)").font(.subheadline.weight(.medium))
                     Text(host).font(.caption2).foregroundColor(.secondary)
                 }
                 Spacer()

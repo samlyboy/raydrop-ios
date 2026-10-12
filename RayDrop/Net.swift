@@ -194,7 +194,9 @@ final class RDDiscovery {
                let data = s.data(using: .utf8),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let app = obj["app"] as? String, app == RD.app,
-               let code = obj["code"] as? String, code != RDStore.shared.myCode {
+               let code = obj["code"] as? String, code != RDStore.shared.myCode,
+               // ★ 再按设备 UUID 过滤一次自己（防止码不同步时自己出现在列表里）
+               (obj["did"] as? String).map({ $0 != RDStore.shared.deviceId }) ?? true {
                 var o = obj
                 o["srcIP"] = srcIP
                 DispatchQueue.main.async { self.onDevice(o) }
