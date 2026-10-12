@@ -4,15 +4,16 @@ import PhotosUI
 import UniformTypeIdentifiers
 
 final class Engine: ObservableObject {
-    /// 设备记录：id 用稳定标识（did）而不是 3 位码 —— 对方改了码也还是同一台设备，不会多出一条
+    /// 设备记录：id 用稳定标识（did）而不是 3 位码 —— 对方改了码也还是同一台设备，不会多出一条。
+    /// 一台设备可能同时有局域网 IP 和 Tailscale IP，两个都存，列表里分组展示由用户选走哪条。
     struct DeviceInfo: Identifiable {
         var id: String
         var code: String
         var name: String
-        var host: String
+        var lanHost: String
+        var tsHost: String
         var port: UInt16
         var lastSeen: Date
-        var cfOnly: Bool
     }
 
     /// 任务列表条目：header=true 是带时间戳的分隔行
@@ -44,13 +45,20 @@ final class Engine: ObservableObject {
     /// 新条目插在最前面（新的在上面）
     private func addEntry(_ text: String, _ color: Color, header: Bool = false) {
         DispatchQueue.main.async {
-            self.logEntries.insert(LogEntry(text: text, inColor: color, isHeader: header), at: 0)
+            // 批次进行中：新条目插在时间戳分隔行下方，让分隔行始终钉在每批任务的顶部
+            let at = (self.pinHeader && !self.logEntries.isEmpty && self.logEntries[0].isHeader && !header) ? 1 : 0
+            self.logEntries.insert(LogEntry(text: text, inColor: color, isHeader: header), at: at)
             if self.logEntries.count > 300 { self.logEntries.removeLast(self.logEntries.count - 300) }
         }
     }
     private func addLog(_ text: String) { addEntry(text, Engine.cSys) }
-    /// 每轮传输插入一条带时间戳的分隔行：分 2 次传就有 2 个时间戳
-    private func addHeader(_ title: String) { addEntry(Engine.fmtTime.string(from: Date()) + "  " + title, Engine.cSys, header: true) }
+    /// 每轮传输插入一条带时间戳的分隔行，钉在该批任务顶部（新条目都插在它下面）
+    private func addHeader(_ title: String) {
+        pinHeader = true
+        addEntry(Engine.fmtTime.string(from: Date()) + "  " + title, Engine.cSys, header: true)
+    }
+    /// 批次进行中标记：结束（完成/失败/终止）后释放，后续新条目回到最顶上
+    private var pinHeader = false
 
     static func fmtSpeed(_ bps: Double) -> String {
         if bps >= 1048576 { return String(format: "%.1f MB/s", bps / 1048576) }
@@ -75,6 +83,7 @@ final class Engine: ObservableObject {
     private func endTx(ok: Bool, msg: String) {
         DispatchQueue.main.async {
             self.txActive = false; self.paused = false
+            self.pinHeader = false   // 批次结束，分隔行不再钉顶
             if ok && self.txTotal > 0 { self.progress = "(\(self.txTotal)/\(self.txTotal)) 完成" }
             else if msg != "接收中断" && !msg.hasPrefix("已终止") { self.progress = "" }
         }
@@ -87,6 +96,7 @@ final class Engine: ObservableObject {
     func abortTx() {
         if txUp { sender.abort() } else { receiver.abort() }
         txActive = false; paused = false; progress = ""
+        pinHeader = false   // 批次被终止，分隔行不再钉顶
     }
 
     func start() {
@@ -116,58 +126,55 @@ final class Engine: ObservableObject {
         sender.onProgress = { [weak self] cur, total, done, bps in self?.updateTx(cur: cur, total: total, bps: bps) }
         sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         receiver.start(); discovery.start()
-        refreshPeers()
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshPeers() }
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.cull() }
     }
-
-    private func register() {
-        let ip = RDIP.tailscaleIP()
-        if !ip.isEmpty { RDDirectory.register(code: myCode, name: myName, ip: ip, port: RD.tcpPort) }
-    }
-
-    /// 每 60s 注册自己到 CF 目录，方便对方用 3 位码查到本机
-    private func refreshPeers() { register() }
 
     private func ingest(_ o: [String: Any]) {
         guard let code = o["code"] as? String else { return }
         let name = o["name"] as? String ?? "设备"
         let ips = o["ips"] as? [String] ?? []
         let port = UInt16((o["port"] as? NSNumber)?.intValue ?? Int(RD.tcpPort))
-        let host = ips.first(where: { $0.hasPrefix("100.") }) ?? ips.first ?? (o["srcIP"] as? String ?? "")
+        // 地址实时分类：ips 是对方当下网卡快照（每次告知都重新枚举）；srcIP 是报文实际来源，最权威
+        var lan = "", ts = ""
+        for ip in ips { if ip.hasPrefix("100.") { if ts.isEmpty { ts = ip } } else if lan.isEmpty { lan = ip } }
+        let src = o["srcIP"] as? String ?? ""
+        if !src.isEmpty { if src.hasPrefix("100.") { ts = src } else { lan = src } }
         let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
-        upsert(id: did, code: code, name: name, host: host, port: port, cfOnly: false)
-        discovery.announceTo(host.isEmpty ? [] : [host])   // 收到就回告一次，对方立刻能看到我
+        upsert(id: did, code: code, name: name, lanHost: lan, tsHost: ts, port: port)
+        discovery.announceTo(src.isEmpty ? [] : [src])   // 回告报文来源，对方立刻能看到我
         syncTargets()
     }
 
-    /// 合并规则：did → 3位码 → 同名同 IP（对方改码后仍视为同一台设备）
-    private func upsert(id: String, code: String, name: String, host: String, port: UInt16, cfOnly: Bool) {
+    /// 合并规则：did → 同名同 IP（对方改码后仍视为同一台设备）。
+    /// 地址实时覆盖：本次告知快照里没有的地址一律清掉，杜绝陈旧 IP 缓存。
+    private func upsert(id: String, code: String, name: String, lanHost: String, tsHost: String, port: UInt16) {
         var idx = devices.firstIndex { $0.id == id }
         if idx == nil { idx = devices.firstIndex { $0.code == code } }
-        if idx == nil, !host.isEmpty { idx = devices.firstIndex { $0.name == name && $0.host == host } }
+        if idx == nil, !lanHost.isEmpty { idx = devices.firstIndex { $0.name == name && $0.lanHost == lanHost } }
+        if idx == nil, !tsHost.isEmpty { idx = devices.firstIndex { $0.name == name && $0.tsHost == tsHost } }
         if let i = idx {
-            if !id.hasPrefix("cf:") { devices[i].id = id }     // 真 did 优先于 cf:code
+            devices[i].id = id.hasPrefix("cf:") ? devices[i].id : id    // 真 did 优先
             devices[i].code = code
             devices[i].name = name
-            if !host.isEmpty { devices[i].host = host }
+            devices[i].lanHost = lanHost
+            devices[i].tsHost = tsHost
             devices[i].port = port
             devices[i].lastSeen = Date()
-            if !cfOnly { devices[i].cfOnly = false }
         } else {
-            devices.append(DeviceInfo(id: id, code: code, name: name, host: host, port: port, lastSeen: Date(), cfOnly: cfOnly))
+            devices.append(DeviceInfo(id: id, code: code, name: name, lanHost: lanHost, tsHost: tsHost, port: port, lastSeen: Date()))
         }
     }
 
-    private func syncTargets() { discovery.setExtraTargets(devices.map { $0.host }.filter { !$0.isEmpty }) }
+    private func syncTargets() {
+        var all: [String] = []
+        for d in devices { if !d.lanHost.isEmpty { all.append(d.lanHost) }; if !d.tsHost.isEmpty { all.append(d.tsHost) } }
+        discovery.setExtraTargets(all)
+    }
 
-    /// 清理：局域网设备 45s 没消息就下线；CF 目录设备 10 分钟后过期。
-    /// 没有这一步，对方改码/重启后旧条目会永远留在列表里（就是之前出现两条的原因之一）。
+    /// 清理：45s 没消息就下线（对方改码/重启后的旧条目靠这个自动消失）。
     private func cull() {
         let now = Date()
-        var kept = devices.filter { now.timeIntervalSince($0.lastSeen) < ($0.cfOnly ? 600 : 45) }
-        let direct = kept.filter { !$0.cfOnly }
-        if !direct.isEmpty { kept = kept.filter { d in !d.cfOnly || !direct.contains { $0.code == d.code } } }
+        let kept = devices.filter { now.timeIntervalSince($0.lastSeen) < 45 }
         if kept.count != devices.count { devices = kept; syncTargets() }
     }
 
@@ -175,31 +182,14 @@ final class Engine: ObservableObject {
         let c = c.trimmingCharacters(in: .whitespaces)
         if c.count == 3 && c.allSatisfy(\.isNumber) {
             RDStore.shared.myCode = c; myCode = c
-            register()
-            discovery.announceTo(devices.map { $0.host }.filter { !$0.isEmpty })
+            discovery.announceTo(devices.flatMap { [$0.lanHost, $0.tsHost] }.filter { !$0.isEmpty })
         }
     }
     func setName(_ n: String) { RDStore.shared.myName = n; myName = n }
 
-    func lookup(_ code: String) {
-        let c = code.trimmingCharacters(in: .whitespaces)
-        guard c.count == 3 else { return }
-        RDDirectory.lookup(code: c) { [weak self] peer in
-            guard let self = self else { return }
-            DispatchQueue.main.async {
-                if let peer = peer, !peer.ip.isEmpty {
-                    self.upsert(id: "cf:" + c, code: c, name: peer.name, host: peer.ip, port: peer.port, cfOnly: true)
-                    self.discovery.announceTo([peer.ip])
-                    self.syncTargets()
-                    self.status = "已找到 \(peer.name)"
-                } else { self.status = "未找到该码的在线设备" }
-            }
-        }
-    }
-
-    /// 发送：按用户在相册里选择的顺序逐个导出并保序传输。
+    /// 发送：按用户在相册里选择的顺序逐个导出并保序传输。host 由用户在设备列表里选定（局域网或 Tailscale）。
     /// 用下标占位保证顺序；每个结果恰好 enter/leave 一次（图片或视频只取其一）。
-    func send(to dev: DeviceInfo, results: [PHPickerResult], completion: @escaping () -> Void) {
+    func send(to dev: DeviceInfo, host: String, results: [PHPickerResult], completion: @escaping () -> Void) {
         let group = DispatchGroup()
         let lock = NSLock()
         var urls: [URL?] = Array(repeating: nil, count: results.count)
@@ -219,7 +209,7 @@ final class Engine: ObservableObject {
         group.notify(queue: .global()) {
             let final = urls.compactMap { $0 }
             guard !final.isEmpty else { return }
-            self.sender.send(host: dev.host, port: dev.port, peerName: dev.name, files: final) { _ in completion() }
+            self.sender.send(host: host, port: dev.port, peerName: dev.name, files: final) { _ in completion() }
         }
     }
     private func copyTemp(_ src: URL) -> URL {
@@ -233,7 +223,7 @@ struct ContentView: View {
     @StateObject var engine = Engine()
     @State var showPicker = false
     @State var pendingResults: [PHPickerResult] = []
-    @State var lookupCode = ""
+    @State var selectedHost = ""
 
     var body: some View {
         NavigationView {
@@ -242,18 +232,19 @@ struct ContentView: View {
                     TextField("3位数字码", text: Binding(get: { engine.myCode }, set: { engine.setCode($0) })).keyboardType(.numberPad)
                     TextField("设备名称", text: Binding(get: { engine.myName }, set: { engine.setName($0) }))
                 }
-                Section("发现的设备") {
-                    if engine.devices.isEmpty { Text("未发现").foregroundColor(.gray) }
-                    ForEach(engine.devices) { d in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) { Text(d.name + " [" + d.code + "]").font(.headline); Text(d.host).font(.caption).foregroundColor(.gray) }
-                            Spacer()
-                            Button("发送到此") { engine.selectedTarget = d; showPicker = true }.font(.caption)
-                        }
-                    }
+                // 分两组：同一台机器两条通道就出现两次（局域网一行、Tailscale 一行），由用户选走哪条
+                Section("【局域网】设备") {
+                    let rows = engine.devices.filter { !$0.lanHost.isEmpty }
+                    if rows.isEmpty { Text("（无）").foregroundColor(.gray) }
+                    ForEach(rows) { d in devRow(d, host: d.lanHost) }
                 }
-                Section("通过 3 位码查找 Tailscale 设备") {
-                    HStack { TextField("3位数字码", text: $lookupCode).keyboardType(.numberPad); Button("查找") { engine.lookup(lookupCode) } }
+                Section("【Tailscale】设备") {
+                    let rows = engine.devices.filter { !$0.tsHost.isEmpty }
+                    if rows.isEmpty { Text("（无）").foregroundColor(.gray) }
+                    ForEach(rows) { d in devRow(d, host: d.tsHost) }
+                }
+                if engine.devices.isEmpty {
+                    Section { Text("未发现设备，等待广播/探测…").foregroundColor(.gray) }
                 }
                 Section("状态") {
                     HStack(alignment: .firstTextBaseline) {
@@ -285,14 +276,22 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("RayDrop 锐传 v7")
+            .navigationTitle("RayDrop 锐传 v8")
         }
         .sheet(isPresented: $showPicker) {
             PhotoPicker { results in
-                if let t = engine.selectedTarget { engine.send(to: t, results: results) {} }
+                if let t = engine.selectedTarget { engine.send(to: t, host: selectedHost, results: results) {} }
             }
         }
         .onAppear { engine.start() }
+    }
+
+    @ViewBuilder private func devRow(_ d: Engine.DeviceInfo, host: String) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) { Text(d.name + " [" + d.code + "]").font(.headline); Text(host).font(.caption).foregroundColor(.gray) }
+            Spacer()
+            Button("发送到此") { engine.selectedTarget = d; selectedHost = host; showPicker = true }.font(.caption)
+        }
     }
 }
 
