@@ -5,6 +5,22 @@ import UniformTypeIdentifiers
 import UIKit
 
 final class Engine: ObservableObject {
+    /// 分享扩展传来的待发送项
+    struct SharedItem: Identifiable {
+        let id = UUID()
+        var url: URL?      // 文件/图片/视频：已复制到沙盒
+        var text: String?  // 文本
+        var name: String
+        var size: Int64
+        var kind: String   // "file" | "text"
+        var isImage: Bool
+        var isVideo: Bool
+        var sizeText: String {
+            if kind == "text" { return "\(size) 字" }
+            if size >= 1048576 { return String(format: "%.1f MB", Double(size) / 1048576.0) }
+            return "\(max(1, size / 1024)) KB"
+        }
+    }
     struct DeviceInfo: Identifiable {
         var id: String
         var code: String
@@ -29,6 +45,10 @@ final class Engine: ObservableObject {
     @Published var paused = false
     /// 已选待发送内容的摘要，如「已选 3 项」
     @Published var pendingSummary = ""
+    /// 从分享扩展收到的待发送项
+    @Published var sharedItems: [SharedItem] = []
+    /// 分享扩展唤起 APP 时置 true，主界面弹出选择设备
+    @Published var showSharePrompt = false
     @Published var receivedFrom = ""
     @Published var receivedText = ""
     @Published var showRecvText = false
@@ -221,6 +241,64 @@ final class Engine: ObservableObject {
             DispatchQueue.main.async { self.pendingItems = []; self.pendingSummary = "" }
         }
     }
+
+    // ---- 分享扩展：读取 App Group 共享容器里暂存的文件 ----
+    static let appGroupID = "group.com.raydrop.ios"
+    static var sharedDir: URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID)
+    }
+
+    /// 主 APP 启动/回到前台时消费分享扩展写入的文件
+    func consumeSharedItems() {
+        guard let dir = Engine.sharedDir else { return }
+        let inbox = dir.appendingPathComponent("inbox")
+        let files = (try? FileManager.default.contentsOfDirectory(at: inbox, includingPropertiesForKeys: nil)) ?? []
+        guard !files.isEmpty else { return }
+        var got: [SharedItem] = []
+        for f in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let name = f.lastPathComponent
+            // 分享扩展用 "t_" 开头表示文本
+            if name.hasPrefix("t_") {
+                let t = (try? String(contentsOf: f, encoding: .utf8)) ?? ""
+                got.append(SharedItem(url: nil, text: t, name: "共享文本", size: Int64(t.count), kind: "text", isImage: false, isVideo: false))
+            } else {
+                // 文件名格式 "f_<原名>"，还原成发送端的真实名字
+                let real = name.hasPrefix("f_") ? String(name.dropFirst(2)) : name
+                let attrs = (try? FileManager.default.attributesOfItem(atPath: f.path)) ?? [:]
+                let sz = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+                let ext = (real as NSString).pathExtension.lowercased()
+                let isImg = ["jpg","jpeg","png","heic","webp","gif","bmp"].contains(ext)
+                let isVid = ["mp4","mov","mkv","avi"].contains(ext)
+                // 复制到临时目录（App Group 容器文件不能长期引用）
+                let tmp = copyTemp(f)
+                got.append(SharedItem(url: tmp, text: nil, name: real, size: sz, kind: "file",
+                                      isImage: isImg, isVideo: isVid))
+            }
+        }
+        DispatchQueue.main.async {
+            self.sharedItems = got
+            self.showSharePrompt = true
+            self.addLog("收到分享内容 \(got.count) 项，请选择设备发送")
+        }
+    }
+
+    func clearShared() { sharedItems = [] }
+
+    /// 把分享来的内容发给指定设备
+    func sendShared(to dev: DeviceInfo, host: String) {
+        guard !sharedItems.isEmpty else { return }
+        var items: [SendItem] = []
+        for it in sharedItems {
+            if it.kind == "text", let t = it.text { items.append(.text(t)) }
+            else if let u = it.url { items.append(.file(u)) }
+        }
+        guard !items.isEmpty else { return }
+        sharedItems = []
+        showSharePrompt = false
+        sender.send(host: host, port: dev.port, peerName: dev.name, items: items) { _ in
+            DispatchQueue.main.async { self.addLog("分享内容已全部发送") }
+        }
+    }
     private func copyTemp(_ src: URL) -> URL {
         let dst = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + src.lastPathComponent)
         try? FileManager.default.copyItem(at: src, to: dst)
@@ -237,6 +315,7 @@ struct ContentView: View {
     @State var textDraft = ""
     @State var editName = false
     @State var editNameDraft = ""
+    @State var showShareInbox = false
 
     var body: some View {
         NavigationView {
@@ -276,14 +355,24 @@ struct ContentView: View {
             Button("关闭", role: .cancel) {}
         } message: { Text(engine.receivedText) }
         .alert("设备名称", isPresented: $editName) {
-            TextField("设备名称", text: $editNameDraft)
             Button("取消", role: .cancel) {}
             Button("确认") { engine.setName(editNameDraft) }
+        } message: {
+            // iOS 15 的 .alert 不支持直接放 TextField（会不弹输入框），改用下方 sheet 弹窗
+            Text(engine.myName)
         }
         .sheet(isPresented: $engine.showSaveFile) {
             if let u = engine.saveFileURL { DocExportPicker(url: u) }
         }
-        .onAppear { engine.start() }
+        .sheet(isPresented: $editName) {
+            NameEditSheet(name: $editNameDraft) { txt in
+                if !txt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { engine.setName(txt) }
+                editName = false
+            } onCancel: { editName = false }
+        }
+        .sheet(isPresented: $engine.showSharePrompt) { ShareInboxSheet(engine: engine) }
+        .onReceive(NotificationCenter.default.publisher(for: .rdAppShouldScanInbox)) { _ in engine.consumeSharedItems() }
+        .onAppear { engine.start(); engine.consumeSharedItems() }
     }
 
     /// 只保留设备名称：前缀加粗大字体，点一下直接编辑（不再显示 3 位码与铅笔图标）
@@ -291,8 +380,7 @@ struct ContentView: View {
         Button {
             editNameDraft = engine.myName
             editName = true
-        } label: {
-            HStack(spacing: 4) {
+        } label: {            HStack(spacing: 4) {
                 Text("设备名称：").font(.headline)
                 Text(engine.myName).font(.title3.weight(.bold))
                 Spacer()
@@ -442,6 +530,102 @@ struct TextInputSheet: View {
     }
 }
 
+/// 设备名称编辑弹窗（用 sheet 而非 alert —— iOS 15 的 alert 不渲染 TextField）
+struct NameEditSheet: View {
+    @Binding var name: String
+    let onSave: (String) -> Void
+    let onCancel: () -> Void
+    @FocusState var focused: Bool
+
+    var body: some View {
+        NavigationView {
+            TextField("设备名称", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .focused($focused)
+                .padding(14)
+                .navigationTitle("修改设备名称")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("取消", action: onCancel) }
+                    ToolbarItem(placement: .confirmationAction) { Button("保存") { onSave(name) } }
+                }
+        }
+        .navigationViewStyle(.stack)
+        .onAppear { focused = true }
+    }
+}
+
+/// 分享进来的文件：App 被唤起时列出，选设备即可发送
+struct ShareInboxSheet: View {
+    @ObservedObject var engine: Engine
+    @Environment(\.presentationMode) var pm
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                if engine.sharedItems.isEmpty {
+                    Text("没有收到分享内容").foregroundColor(.gray).padding(20)
+                } else {
+                    List {
+                        Section(header: Text("共 \(engine.sharedItems.count) 项，点击设备即可发送")) {
+                            ForEach(Array(engine.sharedItems.enumerated()), id: \.offset) { idx, item in
+                                HStack {
+                                    Image(systemName: item.kind == "text" ? "textformat" : (item.isImage ? "photo" : (item.isVideo ? "film" : "doc")))
+                                        .foregroundColor(.blue).frame(width: 26)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.name).font(.subheadline).lineLimit(1)
+                                        Text(item.sizeText).font(.caption2).foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .onDelete { engine.sharedItems.remove(atOffsets: $0) }
+                        }
+                    }
+                }
+                Divider()
+                if engine.devices.isEmpty {
+                    Text("未发现设备…").foregroundColor(.gray).padding(12)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(engine.devices.filter { !$0.lanHost.isEmpty }) { d in devBtn(d, d.lanHost) }
+                            ForEach(engine.devices.filter { !$0.tsHost.isEmpty }) { d in devBtn(d, d.tsHost) }
+                        }
+                        .padding(.horizontal).padding(.vertical, 6)
+                    }
+                    .frame(maxHeight: 210)
+                }
+                HStack {
+                    Button("清空") { engine.clearShared() }.padding(.horizontal, 6)
+                    Spacer()
+                    Button("关闭") { pm.dismiss() }.buttonStyle(.borderedProminent)
+                }
+                .padding(10)
+            }
+            .navigationTitle("分享到 RayDrop").navigationBarTitleDisplayMode(.inline)
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    private func devBtn(_ d: Engine.DeviceInfo, _ host: String) -> some View {
+        Button {
+            engine.sendShared(to: d, host: host)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: d.isComputer ? "desktopcomputer" : "iphone").font(.title3).frame(width: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(d.name) [\(d.code)]").font(.subheadline.weight(.medium))
+                    Text(host).font(.caption2).foregroundColor(.secondary)
+                }
+                Spacer()
+                Image(systemName: "arrow.up.circle.fill").foregroundColor(.accentColor)
+            }
+            .padding(.vertical, 6).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct PhotoPicker: UIViewControllerRepresentable {
     let onPick: ([PHPickerResult]) -> Void
     func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
@@ -486,5 +670,21 @@ struct DocExportPicker: UIViewControllerRepresentable {
 
 @main
 struct RayDropApp: App {
-    var body: some Scene { WindowGroup { ContentView() } }
+    @UIApplicationDelegateAdaptor(RDAppDelegate.self) var appDelegate
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .onReceive(NotificationCenter.default.publisher(for: .rdOpenURL)) { _ in
+                    NotificationCenter.default.post(name: .rdAppShouldScanInbox, object: nil)
+                }
+                .onChange(of: scenePhase) { phase in
+                    // 回前台时检查分享扩展是否放了新文件
+                    if phase == .active { NotificationCenter.default.post(name: .rdAppShouldScanInbox, object: nil) }
+                }
+        }
+    }
 }
+
+extension Notification.Name { static let rdAppShouldScanInbox = Notification.Name("rdAppShouldScanInbox") }

@@ -5,6 +5,11 @@
 	<!-- iOS 14+ 发送 UDP 广播/组播需要该权限（TrollStore 免证书安装时会保留二进制里的权限） -->
 	<key>com.apple.developer.networking.multicast</key>
 	<true/>
+	<!-- 与分享扩展共享文件暂存目录 -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.raydrop.ios</string>
+	</array>
 	<key>get-task-allow</key>
 	<true/>
 </dict>

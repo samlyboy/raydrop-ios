@@ -4,6 +4,13 @@ options:
   deploymentTarget:
     iOS: "15.0"
   createIntermediateGroups: true
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    ENABLE_BITCODE: "NO"
+    SWIFT_VERSION: "5.0"
 targets:
   RayDrop:
     type: application
@@ -19,10 +26,33 @@ targets:
         INFOPLIST_FILE: RayDrop/Info.plist
         PRODUCT_NAME: RayDrop
         ASSETCATALOG_APPICON_NAME: AppIcon
-        SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1,2"
-        CODE_SIGNING_ALLOWED: "NO"
-        CODE_SIGNING_REQUIRED: "NO"
-        CODE_SIGN_IDENTITY: ""
-        ENABLE_BITCODE: "NO"
         GENERATE_INFOPLIST_FILE: "NO"
+        # App Group：分享扩展与主 APP 共享文件暂存目录
+        # （TrollStore 免证书安装时 ldid 会把权限写进二进制）
+        RayDropAppGroup: group.com.raydrop.ios
+    entitlements:
+      path: RayDrop/RayDrop.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.raydrop.ios
+
+  # 分享扩展：相册/文件 → 分享 → RayDrop
+  RayDropShare:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: ShareExtension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.raydrop.ios.share
+        INFOPLIST_FILE: ShareExtension/Info.plist
+        PRODUCT_NAME: RayDropShare
+        GENERATE_INFOPLIST_FILE: "NO"
+        SKIP_INSTALL: "YES"
+    entitlements:
+      path: ShareExtension/RayDropShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.raydrop.ios
