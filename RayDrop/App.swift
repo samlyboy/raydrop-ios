@@ -90,6 +90,10 @@ final class Engine: ObservableObject {
         if bps >= 1048576 { return String(format: "%.1f MB/s", bps / 1048576) }
         return String(format: "%.0f KB/s", bps / 1024)
     }
+    /// 字节 → "x.x" MB 数字部分（传输进度显示「已传/总量」用）
+    static func fmtMB(_ bytes: Int64) -> String {
+        String(format: "%.1f", Double(bytes) / 1048576.0)
+    }
     private func beginTx(up: Bool, peer: String, total: Int) {
         DispatchQueue.main.async {
             self.txUp = up; self.txTotal = total; self.txActive = true; self.paused = false
@@ -99,11 +103,18 @@ final class Engine: ObservableObject {
             self.addHeader(up ? "发送 → \(p)   共 \(total) 项" : "接收 ← \(p)   共 \(total) 项")
         }
     }
-    private func updateTx(cur: Int, total: Int, bps: Double) {
+    private func updateTx(cur: Int, total: Int, done: Int64, size: Int64, bps: Double) {
         DispatchQueue.main.async {
             let t = total > 0 ? total : self.txTotal
             guard t > 0 else { return }
-            self.progress = "(\(min(max(1, cur), t))/\(t)) " + (self.txUp ? "↑上传" : "↓下载") + " " + Engine.fmtSpeed(bps)
+            var s = "(\(min(max(1, cur), t))/\(t)) " + (self.txUp ? "↑上传" : "↓下载")
+            // 文件大小 / 已传 MB / 完成百分比（size<=0 时退化为只显示速度）
+            if size > 0 {
+                let pct = min(100, Int(done * 100 / max(1, size)))
+                s += " \(Engine.fmtMB(done))/\(Engine.fmtMB(size)) MB (\(pct)%)"
+            }
+            s += " · " + Engine.fmtSpeed(bps)
+            self.progress = s
         }
     }
     private func endTx(ok: Bool, msg: String) {
@@ -142,7 +153,7 @@ final class Engine: ObservableObject {
             }
         }
         receiver.onStart = { [weak self] peer, total in self?.beginTx(up: false, peer: peer, total: total) }
-        receiver.onProgress = { [weak self] cur, total, done, bps in self?.updateTx(cur: cur, total: total, bps: bps) }
+        receiver.onProgress = { [weak self] cur, total, done, size, bps in self?.updateTx(cur: cur, total: total, done: done, size: size, bps: bps) }
         receiver.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         discovery.onDevice = { [weak self] o in self?.ingest(o) }
         sender.onStatus = { [weak self] s in
@@ -155,7 +166,7 @@ final class Engine: ObservableObject {
             }
         }
         sender.onStart = { [weak self] peer, total in self?.beginTx(up: true, peer: peer, total: total) }
-        sender.onProgress = { [weak self] cur, total, done, bps in self?.updateTx(cur: cur, total: total, bps: bps) }
+        sender.onProgress = { [weak self] cur, total, done, size, bps in self?.updateTx(cur: cur, total: total, done: done, size: size, bps: bps) }
         sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         receiver.start(); discovery.start()
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.cull() }

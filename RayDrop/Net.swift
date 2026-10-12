@@ -211,14 +211,16 @@ final class RDReceiver {
     var onStatus: (String) -> Void = { _ in }
     var onSaved: (String, String) -> Void = { _, _ in }
     var onStart: (String, Int) -> Void = { _, _ in }                    // 对端名, 文件总数
-    var onProgress: (Int, Int, Int, Double) -> Void = { _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 字节/秒
+    var onProgress: (Int, Int, Int64, Int64, Double) -> Void = { _, _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 文件总大小, 字节/秒
     var onEnd: (Bool, String) -> Void = { _, _ in }
     var onText: (String, String) -> Void = { _, _ in }                       // 收到文本消息(来自, 文本)
     var onFileToSave: (String, URL, String, String) -> Void = { _,_,_,_ in }    // 非媒体文件(来自, 临时URL, 名, mime)→上层存"文件"App
     private var listener: NWListener?
     private var current: RDStream?
+    private var aborted = false;   // 用户点「终止」→ 与意外中断区分提示
 
     func start() {
+        aborted = false
         do {
             let l = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: RD.tcpPort)!)
             l.newConnectionHandler = { (conn: NWConnection) in
@@ -237,7 +239,7 @@ final class RDReceiver {
 
     func pause() { current?.setPaused(true) }
     func resume() { current?.setPaused(false) }
-    func abort() { current?.close(); current = nil }
+    func abort() { aborted = true; current?.close(); current = nil }
 
     private func handle(_ s: RDStream) async {
         var total = 0
@@ -287,7 +289,7 @@ final class RDReceiver {
                     if dt >= 0.2 {
                         spd = Double(done - lastBytes) / dt
                         lastTick = now; lastBytes = done
-                        self.onProgress(i + 1, total, done, spd)
+                        self.onProgress(i + 1, total, Int64(done), Int64(size), spd)
                     }
                 }
                 try? handle.close()
@@ -318,8 +320,8 @@ final class RDReceiver {
             onStatus(saveFailed ? "接收结束（部分文件未保存）" : "接收完成：\(fromName)")
             onEnd(!saveFailed, saveFailed ? "部分文件保存失败" : "接收完成")
         } catch {
-            onStatus("接收中断")
-            onEnd(false, "接收中断")
+            if aborted { onStatus("已终止"); onEnd(false, "已终止") }
+            else { onStatus("接收中断"); onEnd(false, "接收中断") }
         }
     }
 }
@@ -332,7 +334,7 @@ enum SendItem { case file(URL); case text(String) }
 final class RDSender {
     var onStatus: (String) -> Void = { _ in }
     var onStart: (String, Int) -> Void = { _, _ in }
-    var onProgress: (Int, Int, Int, Double) -> Void = { _, _, _, _ in }
+    var onProgress: (Int, Int, Int64, Int64, Double) -> Void = { _, _, _, _, _ in }
     var onEnd: (Bool, String) -> Void = { _, _ in }
     private var conn: NWConnection?
     private var paused = false, aborted = false, finished = false
@@ -415,7 +417,7 @@ final class RDSender {
                         if dt >= 0.2 {
                             spd = Double(off - lastB) / dt
                             lastTick = now; lastB = off
-                            self.onProgress(i + 1, items.count, off, spd)
+                            self.onProgress(i + 1, items.count, Int64(off), Int64(size), spd)
                         }
                     }
                     try? handle?.close()
