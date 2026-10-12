@@ -31,7 +31,10 @@ final class Engine: ObservableObject {
         var port: UInt16
         var lastSeen: Date
         /// 手机 vs 电脑图标
-        var isComputer: Bool { platform.lowercased().contains("pc") || platform.lowercased().contains("mac") }
+        var isComputer: Bool {
+            let p = platform.lowercased()
+            return p.contains("pc") || p.contains("mac") || p.contains("win") || p.contains("windows") || p.contains("linux")
+        }
     }
     struct LogEntry: Identifiable { let id = UUID(); let text: String; let inColor: Color; let isHeader: Bool }
 
@@ -537,6 +540,7 @@ struct ContentView: View {
                 Spacer()
                 if !engine.progress.isEmpty { Text(engine.progress).font(.caption).foregroundColor(.secondary) }
             }
+            .padding(.top, 18)      // ★ 状态区整体下移，与上方设备列表拉开距离
             if engine.txActive {
                 HStack(spacing: 10) {
                     Button(engine.paused ? "继续" : "暂停") { engine.togglePause() }.buttonStyle(.bordered).controlSize(.small)

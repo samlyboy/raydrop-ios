@@ -154,7 +154,7 @@ final class RDDiscovery {
                 for h in 1...254 { targets.append("\(parts[0]).\(parts[1]).\(parts[2]).\(h)") }
             }
             for ip in targets { send(to: ip) }
-            Thread.sleep(forTimeInterval: 15)
+            Thread.sleep(forTimeInterval: 5)      // ★ 5 秒一轮，保证在线设备实时更新
         }
     }
 
