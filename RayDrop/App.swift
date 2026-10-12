@@ -235,6 +235,10 @@ struct ContentView: View {
     @State var showDoc = false
     @State var showText = false
     @State var textDraft = ""
+    @State var editCode = false
+    @State var editCodeDraft = ""
+    @State var editName = false
+    @State var editNameDraft = ""
 
     var body: some View {
         NavigationView {
@@ -252,6 +256,11 @@ struct ContentView: View {
             }
             .navigationTitle("RayDrop锐传")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: openFiles) { Label("打开文件浏览器", systemImage: "folder") }
+                }
+            }
         }
         .sheet(isPresented: $showPhoto) {
             PhotoPicker { results in engine.preparePhotos(results); showPhoto = false }
@@ -268,6 +277,16 @@ struct ContentView: View {
             Button("复制") { UIPasteboard.general.string = engine.receivedText }
             Button("关闭", role: .cancel) {}
         } message: { Text(engine.receivedText) }
+        .alert("修改3位码", isPresented: $editCode) {
+            TextField("3位数字", text: $editCodeDraft).keyboardType(.numberPad)
+            Button("取消", role: .cancel) {}
+            Button("确认") { engine.setCode(editCodeDraft) }
+        }
+        .alert("设备名称", isPresented: $editName) {
+            TextField("设备名称", text: $editNameDraft)
+            Button("取消", role: .cancel) {}
+            Button("确认") { engine.setName(editNameDraft) }
+        }
         .sheet(isPresented: $engine.showSaveFile) {
             if let u = engine.saveFileURL { DocExportPicker(url: u) }
         }
@@ -275,16 +294,27 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("RayDrop锐传").font(.title3.bold())
-            HStack {
-                Text("码 \(engine.myCode)").font(.title3.monospacedDigit().weight(.semibold))
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text(engine.myCode).font(.title3.monospacedDigit().weight(.bold))
+                pencil { editCodeDraft = engine.myCode; editCode = true }
                 Spacer()
             }
-            TextField("设备名称", text: Binding(get: { engine.myName }, set: { engine.setName($0) }))
-                .textFieldStyle(.roundedBorder).font(.subheadline)
+            HStack(spacing: 4) {
+                Text(engine.myName).font(.subheadline)
+                pencil { editNameDraft = engine.myName; editName = true }
+                Spacer()
+            }
         }
-        .padding(.horizontal).padding(.top, 6)
+        .padding(.horizontal).padding(.top, 4)
+    }
+    private func pencil(_ action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: "pencil").font(.caption) }
+            .buttonStyle(.plain).foregroundColor(.secondary)
+    }
+    /// 快速打开系统「文件」App，免去退出到桌面再找
+    private func openFiles() {
+        if let u = URL(string: "file://") { UIApplication.shared.open(u) }
     }
 
     private var kindBar: some View {
