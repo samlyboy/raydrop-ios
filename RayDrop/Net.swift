@@ -192,7 +192,7 @@ final class RDReceiver {
     var onProgress: (Int, Int, Int, Double) -> Void = { _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 字节/秒
     var onEnd: (Bool, String) -> Void = { _, _ in }
     var onText: (String, String) -> Void = { _, _ in }                       // 收到文本消息(来自, 文本)
-    var onFileToSave: (String, URL, String, String) -> Void = { _,_,_,_ }    // 非媒体文件(来自, 临时URL, 名, mime)→上层存"文件"App
+    var onFileToSave: (String, URL, String, String) -> Void = { _,_,_,_ in }    // 非媒体文件(来自, 临时URL, 名, mime)→上层存"文件"App
     private var listener: NWListener?
     private var current: RDStream?
 
