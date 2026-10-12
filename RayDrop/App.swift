@@ -230,7 +230,9 @@ final class Engine: ObservableObject {
     }
     private func cull() {
         let now = Date()
-        let kept = devices.filter { now.timeIntervalSince($0.lastSeen) < 45 }
+        // ★ 12 秒没收到对方报文即判离线（对方广播周期 3~5s，12s 容得下丢包）。
+        //   原来 45s 会让「APP 一关，其它端还挂着显示在线」将近一分钟。
+        let kept = devices.filter { now.timeIntervalSince($0.lastSeen) < 12 }
         if kept.count != devices.count { devices = kept; syncTargets() }
     }
 

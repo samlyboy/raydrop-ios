@@ -9,8 +9,8 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>RayDrop</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>18.0</string>
-	<key>CFBundleVersion</key><string>18</string>
+	<key>CFBundleShortVersionString</key><string>19.0</string>
+	<key>CFBundleVersion</key><string>19</string>
 	<key>LSRequiresIPhoneOS</key><true/>
 	<key>NSLocalNetworkUsageDescription</key><string>用于在同一局域网内发现 RayDrop 设备</string>
 	<key>NSPhotoLibraryAddUsageDescription</key><string>用于把接收到的图片/视频保存到你的相册</string>
