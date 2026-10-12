@@ -676,9 +676,6 @@ struct RayDropApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .onReceive(NotificationCenter.default.publisher(for: .rdOpenURL)) { _ in
-                    NotificationCenter.default.post(name: .rdAppShouldScanInbox, object: nil)
-                }
                 .onChange(of: scenePhase) { phase in
                     // 回前台时检查分享扩展是否放了新文件
                     if phase == .active { NotificationCenter.default.post(name: .rdAppShouldScanInbox, object: nil) }
