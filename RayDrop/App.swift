@@ -284,9 +284,22 @@ final class Engine: ObservableObject {
     }
 
     /// 主 APP 启动/回到前台时消费分享扩展写入的文件
+    ///
+    /// ⚠️ 关键：取走的内容必须**立即从 inbox 删除**，否则每次启动都会把上一批又读一遍，
+    /// 表现就是「关掉重开还在，第二次分享变成两个，越积越多」。这里读完即删，并顺带清理过期残留。
     func consumeSharedItems() {
         guard let dir = Engine.sharedDir else { return }
         let inbox = dir.appendingPathComponent("inbox")
+
+        // 1) 清理超过 1 小时的残留（上次崩溃/被杀进程留下的），避免历史文件再冒出来
+        if let olds = try? FileManager.default.contentsOfDirectory(at: inbox, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            for old in olds {
+                let age = (try? FileManager.default.attributesOfItem(atPath: old.path)[.modificationDate] as? Date)
+                    .map { Date().timeIntervalSince($0) } ?? 0
+                if age > 3600 { try? FileManager.default.removeItem(at: old) }
+            }
+        }
+
         let files = (try? FileManager.default.contentsOfDirectory(at: inbox, includingPropertiesForKeys: nil)) ?? []
         guard !files.isEmpty else { return }
         var got: [SharedItem] = []
@@ -295,7 +308,10 @@ final class Engine: ObservableObject {
             // 分享扩展用 "t_" 开头表示文本
             if name.hasPrefix("t_") {
                 let t = (try? String(contentsOf: f, encoding: .utf8)) ?? ""
-                got.append(SharedItem(url: nil, text: t, name: "共享文本", size: Int64(t.count), kind: "text", isImage: false, isVideo: false))
+                if !t.isEmpty {
+                    got.append(SharedItem(url: nil, text: t, name: "共享文本", size: Int64(t.count), kind: "text", isImage: false, isVideo: false))
+                }
+                try? FileManager.default.removeItem(at: f)   // 取走即删
             } else {
                 // 文件名格式 "f_<原名>"，还原成发送端的真实名字
                 let real = name.hasPrefix("f_") ? String(name.dropFirst(2)) : name
@@ -304,13 +320,22 @@ final class Engine: ObservableObject {
                 let ext = (real as NSString).pathExtension.lowercased()
                 let isImg = ["jpg","jpeg","png","heic","webp","gif","bmp"].contains(ext)
                 let isVid = ["mp4","mov","mkv","avi"].contains(ext)
-                // 复制到临时目录（App Group 容器文件不能长期引用）
-                let tmp = copyTemp(f)
+                // 移到临时目录（App Group 容器文件不能长期引用），同时从 inbox 移除
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString + "-" + real)
+                try? FileManager.default.removeItem(at: tmp)
+                do {
+                    try FileManager.default.moveItem(at: f, to: tmp)   // move 而非 copy：inbox 里的原件随之消失
+                } catch {
+                    try? FileManager.default.copyItem(at: f, to: tmp)
+                    try? FileManager.default.removeItem(at: f)
+                }
                 got.append(SharedItem(url: tmp, text: nil, name: real, size: sz, kind: "file",
                                       isImage: isImg, isVideo: isVid))
             }
         }
         DispatchQueue.main.async {
+            guard !got.isEmpty else { return }
             self.sharedItems = got
             self.showSharePrompt = true
             self.addLog("收到分享内容 \(got.count) 项，请选择设备发送")
@@ -319,7 +344,13 @@ final class Engine: ObservableObject {
 
     func clearShared() { sharedItems = [] }
 
-    /// 把分享来的内容发给指定设备
+    /// 关闭分享面板：本次分享即结束，清空暂存（下次启动不会再次出现）
+    func dismissShareInbox() {
+        sharedItems = []
+        showSharePrompt = false
+    }
+
+    /// 把分享来的内容发给指定设备（发送后自动清空本次分享）
     func sendShared(to dev: DeviceInfo, host: String) {
         guard !sharedItems.isEmpty else { return }
         var items: [SendItem] = []
@@ -327,11 +358,23 @@ final class Engine: ObservableObject {
             if it.kind == "text", let t = it.text { items.append(.text(t)) }
             else if let u = it.url { items.append(.file(u)) }
         }
-        guard !items.isEmpty else { return }
-        sharedItems = []
-        showSharePrompt = false
-        sender.send(host: host, port: dev.port, peerName: dev.name, items: items) { _ in
-            DispatchQueue.main.async { self.addLog("分享内容已全部发送") }
+        guard !items.isEmpty else { dismissShareInbox(); return }
+        // 先清空：无论发送成功与否，这次分享都已经结束
+        dismissShareInbox()
+        sender.send(host: host, port: dev.port, peerName: dev.name, items: items) { ok in
+            DispatchQueue.main.async {
+                self.addLog(ok ? "分享内容已全部发送" : "分享内容发送失败")
+                if ok { self.clearPendingTempFiles() }
+            }
+        }
+    }
+
+    /// 清理本轮分享复制到临时目录的文件，避免长期占用空间
+    func clearPendingTempFiles() {
+        let tmp = FileManager.default.temporaryDirectory
+        guard let fs = try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil) else { return }
+        for f in fs where f.lastPathComponent.contains("-") && f.lastPathComponent.count > 36 {
+            try? FileManager.default.removeItem(at: f)
         }
     }
     private func copyTemp(_ src: URL) -> URL {
@@ -628,7 +671,8 @@ struct ShareInboxSheet: View {
                 HStack {
                     Button("清空") { engine.clearShared() }.padding(.horizontal, 6)
                     Spacer()
-                    Button("关闭") { dismiss() }.buttonStyle(.borderedProminent)
+                    // 关闭即视为本次分享结束：清空暂存，下次启动不会再次出现
+                    Button("关闭") { engine.dismissShareInbox() }.buttonStyle(.borderedProminent)
                 }
                 .padding(10)
             }

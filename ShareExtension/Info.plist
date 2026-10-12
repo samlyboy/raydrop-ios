@@ -12,8 +12,8 @@
 	<key>CFBundleDevelopmentRegion</key><string>en</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundlePackageType</key><string>XPC!</string>
-	<key>CFBundleShortVersionString</key><string>16.0</string>
-	<key>CFBundleVersion</key><string>16</string>
+	<key>CFBundleShortVersionString</key><string>17.0</string>
+	<key>CFBundleVersion</key><string>17</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>
