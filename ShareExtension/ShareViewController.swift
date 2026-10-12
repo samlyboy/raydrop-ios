@@ -56,62 +56,89 @@ final class ShareViewController: UIViewController
     func handle()
     {
         guard let items = extensionContext?.inputItems as? [NSExtensionItem] else { finish(0); return }
-        var urls: [URL] = []
-        var text = ""
+        guard let inbox = inboxDir() else { DispatchQueue.main.async { self.finish(0) }; return }
 
-        // 先把 NSItemProvider 提供的文件拷到 inbox
+        // 计数器：等所有 provider 的异步回调都完成再收尾
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var count = 0
+        let seq = DispatchQueue(label: "share.copy")
+
+        func save(_ src: URL) {
+            let base = src.lastPathComponent.isEmpty ? ("share_" + UUID().uuidString) : src.lastPathComponent
+            let dst = inbox.appendingPathComponent("f_" + base)
+            try? FileManager.default.removeItem(at: dst)
+            // loadFileRepresentation 给的 URL 是系统临时文件，回调结束即被删除 → 必须同步复制
+            do { try FileManager.default.copyItem(at: src, to: dst) } catch { return }
+            seq.sync { count += 1 }
+        }
+        func saveText(_ t: String) {
+            let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let dst = inbox.appendingPathComponent("t_text.txt")
+            try? trimmed.write(to: dst, atomically: true, encoding: .utf8)
+            seq.sync { count += 1 }
+        }
+
         for item in items
         {
             for provider in item.attachments ?? []
             {
                 if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
                 {
+                    group.enter()
                     provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { obj, _ in
-                        if let u = obj as? URL { urls.append(u) }
+                        defer { group.leave() }
+                        if let u = obj as? URL { save(u) }
+                    }
+                }
+                // 图片/视频：用具体的 image / movie 类型注册，UTType.item 在相册分享时匹配不到
+                else if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier)
+                {
+                    group.enter()
+                    provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
+                        defer { group.leave() }
+                        if let url { save(url) }
                     }
                 }
                 else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier)
-                    || provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier)
-                    || provider.hasItemConformingToTypeIdentifier("public.data")
                 {
-                    provider.loadFileRepresentation(forTypeIdentifier: UTType.item.identifier) { url, _ in
-                        if let url { urls.append(url) }
+                    group.enter()
+                    provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { url, _ in
+                        defer { group.leave() }
+                        if let url { save(url) }
                     }
                 }
                 else if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
                 {
+                    group.enter()
                     provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { obj, _ in
-                        if let s = obj as? String { text += s }
+                        defer { group.leave() }
+                        if let s = obj as? String { saveText(s) }
+                    }
+                }
+                else
+                {
+                    // 兜底：任何 public.data 类附件
+                    group.enter()
+                    provider.loadFileRepresentation(forTypeIdentifier: UTType.data.identifier) { url, _ in
+                        defer { group.leave() }
+                        if let url { save(url) }
                     }
                 }
             }
-            if let s = item.attributedContentText?.string { text += s }
+            if let s = item.attributedContentText?.string { saveText(s) }
         }
 
-        // 等待 provider 的异步回调落地（最多 1.5s）
-        let deadline = Date().addingTimeInterval(1.5)
-        while Date() < deadline && urls.isEmpty && text.isEmpty { usleep(50_000) }
-        usleep(300_000)
-
-        var count = 0
-        if let inbox = inboxDir()
-        {
-            for u in urls
-            {
-                let base = u.lastPathComponent.isEmpty ? ("share_" + UUID().uuidString) : u.lastPathComponent
-                let dst = inbox.appendingPathComponent("f_" + base)
-                try? FileManager.default.removeItem(at: dst)
-                do { try FileManager.default.copyItem(at: u, to: dst); count += 1 } catch { }
+        // 等所有异步回调（最多 8 秒）
+        let deadline = DispatchTime.now() + 8
+        DispatchQueue.global().async {
+            while group.wait(timeout: .now()) == .timedOut && DispatchTime.now() < deadline {
+                usleep(50_000)
             }
-            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            {
-                let dst = inbox.appendingPathComponent("t_text.txt")
-                try? text.write(to: dst, atomically: true, encoding: .utf8)
-                count += 1
-            }
+            let n = seq.sync { count }
+            DispatchQueue.main.async { self.finish(n) }
         }
-
-        DispatchQueue.main.async { self.finish(count) }
     }
 
     func finish(_ count: Int)
@@ -125,16 +152,27 @@ final class ShareViewController: UIViewController
             return
         }
         statusLabel.text = "已准备 \(count) 项，正在打开 RayDrop…"
-        // 扩展里不能调 UIApplication.shared（iOS 会拒绝编译），也拉不起主 APP。
-        // 做法：只把文件放进 App Group 的 inbox，然后关闭扩展；
-        // 主 APP 在 onAppear / 回前台 / 收到 Darwin 通知时扫描 inbox 并弹设备列表。
-        // 用 CFNotificationCenter 通知主 APP（主 APP 已在后台时也能被唤醒）。
+        // 扩展里禁止 UIApplication.shared，但 NSExtensionContext.open 是允许的：
+        // 它会直接跳到主 APP（而不是让用户手动切出去再找）。
+        // 同时用 Darwin 通知兜底，保证主 APP 在后台时也能被唤醒扫描 inbox。
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),
             CFNotificationName("com.raydrop.ios.sharedItemsAdded" as CFString),
             nil, nil, true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+
+        if let ctx = extensionContext, let url = URL(string: "raydrop://shared")
+        {
+            ctx.open(url) { success in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    self?.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+                }
+            }
+        }
+        else
+        {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+            }
         }
     }
 }

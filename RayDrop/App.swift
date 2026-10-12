@@ -164,14 +164,49 @@ final class Engine: ObservableObject {
         let platform = o["platform"] as? String ?? ""
         let ips = o["ips"] as? [String] ?? []
         let port = UInt16((o["port"] as? NSNumber)?.intValue ?? Int(RD.tcpPort))
-        var lan = "", ts = ""
-        for ip in ips { if ip.hasPrefix("100.") { if ts.isEmpty { ts = ip } } else if lan.isEmpty { lan = ip } }
+
+        // 按「本机是否具备该通道」+「是否与对端同网段」过滤，只显示真能连上的地址：
+        // ① 本机没有 Tailscale(100.x) → 不显示对方的 Tailscale 地址（连了也传不了）
+        // ② 对方局域网地址与本机不同 /24 → 不显示局域网地址（不在同一局域网）
+        let myIPs = RDIP.ips()
+        let myHasTS = myIPs.contains { $0.hasPrefix("100.") }
+        var peerLan = "", peerTS = ""
+        for ip in ips {
+            if ip.hasPrefix("100.") { if peerTS.isEmpty { peerTS = ip } }
+            else if peerLan.isEmpty { peerLan = ip }
+        }
         let src = o["srcIP"] as? String ?? ""
-        if !src.isEmpty { if src.hasPrefix("100.") { ts = src } else { lan = src } }
+        if !src.isEmpty {
+            if src.hasPrefix("100.") { peerTS = src }
+            else if peerLan.isEmpty || !Engine.sameSubnet(src, myIPs) { peerLan = src }
+        }
+        // 过滤：局域网要同网段；Tailscale 要本机也有
+        var lan = ""
+        if !peerLan.isEmpty && Engine.sameSubnet(peerLan, myIPs) { lan = peerLan }
+        var ts = ""
+        if myHasTS && !peerTS.isEmpty { ts = peerTS }
+        // 兜底：报文来源一定可达（同网段且是真实来源），优先用它做局域网通道
+        if lan.isEmpty && !src.isEmpty && !src.hasPrefix("100.") && Engine.sameSubnet(src, myIPs) { lan = src }
+        // 两边都没有可用通道时，至少保留原始快照，保证用户能看到设备（但会标注不可连）
+        if lan.isEmpty && ts.isEmpty {
+            lan = peerLan; ts = peerTS
+        }
+
         let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
         upsert(id: did, code: code, name: name, platform: platform, lanHost: lan, tsHost: ts, port: port)
-        discovery.announceTo(src.isEmpty ? [] : [src])
+        discovery.announceTo(src.isEmpty ? [] : [src])   // 回告报文来源，对方立刻能看到我
         syncTargets()
+    }
+
+    /// 该 IP 是否与本机任一局域网 IP 同 /24 网段
+    static func sameSubnet(_ ip: String, _ myIPs: [String]) -> Bool {
+        let p = ip.split(separator: ".").map(String.init)
+        guard p.count == 4 else { return false }
+        for my in myIPs where !my.hasPrefix("100.") {
+            let m = my.split(separator: ".").map(String.init)
+            if m.count == 4 && m[0] == p[0] && m[1] == p[1] && m[2] == p[2] { return true }
+        }
+        return false
     }
     private func upsert(id: String, code: String, name: String, platform: String, lanHost: String, tsHost: String, port: UInt16) {
         var idx = devices.firstIndex { $0.id == id }
