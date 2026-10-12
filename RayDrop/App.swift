@@ -194,6 +194,9 @@ final class Engine: ObservableObject {
         if lan.isEmpty && ts.isEmpty {
             lan = peerLan; ts = peerTS
         }
+        // ★ 设备若可通过 Tailscale 到达，则只用 Tailscale 地址：对端自报的局域网地址多为
+        //   其另一物理网络的 192.168.1.x（与本机恰巧同名 /24 但不可达），既连不通又会在列表制造重复条目。
+        if !ts.isEmpty { lan = "" }
 
         let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
         upsert(id: did, code: code, name: name, platform: platform, lanHost: lan, tsHost: ts, port: port)
