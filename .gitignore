@@ -1,5 +1,8 @@
-.DS_Store
+# 构建产物与大文件，不入库
+dist/
 build/
-*.xcodeproj
-Payload/
-raydrop.ipa
+app.zip
+app_extract/
+*.ipa
+*.xcarchive/
+*.xcodeproj/
