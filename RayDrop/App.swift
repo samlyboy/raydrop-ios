@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
+import UIKit
 
 final class Engine: ObservableObject {
     /// 设备记录：id 用稳定标识（did）而不是 3 位码 —— 对方改了码也还是同一台设备，不会多出一条。
@@ -29,6 +30,14 @@ final class Engine: ObservableObject {
     @Published var progress = ""
     @Published var txActive = false
     @Published var paused = false
+    /// 收到的文本消息（弹窗展示 + 复制）
+    @Published var receivedFrom = ""
+    @Published var receivedText = ""
+    @Published var showRecvText = false
+    /// 收到的非媒体文件 → 弹出「存储到文件」
+    @Published var saveFileURL: URL? = nil
+    @Published var saveFileName = ""
+    @Published var showSaveFile = false
 
     private let receiver = RDReceiver()
     private let discovery = RDDiscovery()
@@ -70,7 +79,7 @@ final class Engine: ObservableObject {
             let p = peer.isEmpty ? "对方" : peer
             self.txPeer = p
             self.progress = "(0/\(max(1, total))) " + (up ? "↑上传" : "↓下载") + " 0 KB/s"
-            self.addHeader(up ? "发送 → \(p)   共 \(total) 个" : "接收 ← \(p)   共 \(total) 个")
+            self.addHeader(up ? "发送 → \(p)   共 \(total) 项" : "接收 ← \(p)   共 \(total) 项")
         }
     }
     private func updateTx(cur: Int, total: Int, bps: Double) {
@@ -104,6 +113,20 @@ final class Engine: ObservableObject {
         receiver.onSaved = { [weak self] from, name in
             // 接收：红色「一加 → 本机  003_001_xxx.jpg」
             self?.addEntry("\(from) → 本机  \(name)", Engine.cIn)
+        }
+        receiver.onText = { [weak self] from, text in
+            DispatchQueue.main.async {
+                self?.receivedFrom = from.isEmpty ? "对方" : from
+                self?.receivedText = text
+                self?.showRecvText = true
+                self?.addEntry("\(from) → 本机  [文本] \(text.count) 字", Engine.cIn)
+            }
+        }
+        receiver.onFileToSave = { [weak self] from, url, name, mime in
+            DispatchQueue.main.async {
+                self?.saveFileURL = url; self?.saveFileName = name; self?.showSaveFile = true
+                self?.addEntry("\(from) → 本机  \(name)（待存储到文件）", Engine.cIn)
+            }
         }
         receiver.onStart = { [weak self] peer, total in self?.beginTx(up: false, peer: peer, total: total) }
         receiver.onProgress = { [weak self] cur, total, done, bps in self?.updateTx(cur: cur, total: total, bps: bps) }
@@ -187,8 +210,7 @@ final class Engine: ObservableObject {
     }
     func setName(_ n: String) { RDStore.shared.myName = n; myName = n }
 
-    /// 发送：按用户在相册里选择的顺序逐个导出并保序传输。host 由用户在设备列表里选定（局域网或 Tailscale）。
-    /// 用下标占位保证顺序；每个结果恰好 enter/leave 一次（图片或视频只取其一）。
+    /// 发送相册：按用户在相册里选择的顺序逐个导出并保序传输。
     func send(to dev: DeviceInfo, host: String, results: [PHPickerResult], completion: @escaping () -> Void) {
         let group = DispatchGroup()
         let lock = NSLock()
@@ -209,9 +231,21 @@ final class Engine: ObservableObject {
         group.notify(queue: .global()) {
             let final = urls.compactMap { $0 }
             guard !final.isEmpty else { return }
-            self.sender.send(host: host, port: dev.port, peerName: dev.name, files: final) { _ in completion() }
+            self.sender.send(host: host, port: dev.port, peerName: dev.name, items: final.map { .file($0) }) { _ in completion() }
         }
     }
+
+    /// 发送系统文件（来自文档选择器的 URL，asCopy 已在本地）
+    func sendFiles(to dev: DeviceInfo, host: String, urls: [URL], completion: @escaping () -> Void) {
+        guard !urls.isEmpty else { return }
+        sender.send(host: host, port: dev.port, peerName: dev.name, items: urls.map { .file($0) }) { _ in completion() }
+    }
+
+    /// 发送文本消息
+    func sendText(to dev: DeviceInfo, host: String, text: String, completion: @escaping () -> Void) {
+        sender.send(host: host, port: dev.port, peerName: dev.name, items: [.text(text)]) { _ in completion() }
+    }
+
     private func copyTemp(_ src: URL) -> URL {
         let dst = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + src.lastPathComponent)
         try? FileManager.default.copyItem(at: src, to: dst)
@@ -222,7 +256,9 @@ final class Engine: ObservableObject {
 struct ContentView: View {
     @StateObject var engine = Engine()
     @State var showPicker = false
-    @State var pendingResults: [PHPickerResult] = []
+    @State var showDocPicker = false
+    @State var showTextInput = false
+    @State var textDraft = ""
     @State var selectedHost = ""
 
     var body: some View {
@@ -245,6 +281,19 @@ struct ContentView: View {
                 }
                 if engine.devices.isEmpty {
                     Section { Text("未发现设备，等待广播/探测…").foregroundColor(.gray) }
+                }
+                // 发送类型：先在设备列表「选此设备」，再选发相册/发文本/发文件
+                Section("发送") {
+                    if let t = engine.selectedTarget {
+                        Text("目标：\(t.name) [\(t.code)] · \(selectedHost)").font(.caption).foregroundColor(.secondary)
+                    } else {
+                        Text("请先在设备列表点「选此设备」").font(.caption).foregroundColor(.gray)
+                    }
+                    HStack {
+                        Button("发相册") { showPicker = true }.disabled(engine.selectedTarget == nil)
+                        Button("发文本") { showTextInput = true }.disabled(engine.selectedTarget == nil)
+                        Button("发文件") { showDocPicker = true }.disabled(engine.selectedTarget == nil)
+                    }
                 }
                 Section("状态") {
                     HStack(alignment: .firstTextBaseline) {
@@ -276,12 +325,38 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("RayDrop 锐传 v8")
+            .navigationTitle("RayDrop 锐传 v9")
         }
+        // 相册选择
         .sheet(isPresented: $showPicker) {
             PhotoPicker { results in
                 if let t = engine.selectedTarget { engine.send(to: t, host: selectedHost, results: results) {} }
             }
+        }
+        // 系统文件选择
+        .sheet(isPresented: $showDocPicker) {
+            DocPicker { urls in
+                if let t = engine.selectedTarget { engine.sendFiles(to: t, host: selectedHost, urls: urls) {} }
+            }
+        }
+        // 发送文本输入
+        .alert("发送文本 → \(selectedHost)", isPresented: $showTextInput) {
+            TextEditor(text: $textDraft).frame(height: 160)
+            Button("发送") {
+                let txt = textDraft
+                textDraft = ""
+                if let t = engine.selectedTarget { engine.sendText(to: t, host: selectedHost, text: txt) {} }
+            }
+            Button("取消", role: .cancel) { textDraft = "" }
+        } message: { Text("输入要发送的文字资料") }
+        // 收到文本消息
+        .alert("文本来自 \(engine.receivedFrom)", isPresented: $engine.showRecvText) {
+            Button("复制") { UIPasteboard.general.string = engine.receivedText }
+            Button("关闭", role: .cancel) {}
+        } message: { Text(engine.receivedText) }
+        // 收到非媒体文件 → 存储到「文件」App
+        .sheet(isPresented: $engine.showSaveFile) {
+            if let u = engine.saveFileURL { DocExportPicker(url: u, fileName: engine.saveFileName) }
         }
         .onAppear { engine.start() }
     }
@@ -290,11 +365,12 @@ struct ContentView: View {
         HStack {
             VStack(alignment: .leading, spacing: 2) { Text(d.name + " [" + d.code + "]").font(.headline); Text(host).font(.caption).foregroundColor(.gray) }
             Spacer()
-            Button("发送到此") { engine.selectedTarget = d; selectedHost = host; showPicker = true }.font(.caption)
+            Button("选此设备") { engine.selectedTarget = d; selectedHost = host }.font(.caption)
         }
     }
 }
 
+/// 相册多选
 struct PhotoPicker: UIViewControllerRepresentable {
     let onPick: ([PHPickerResult]) -> Void
     func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
@@ -307,6 +383,42 @@ struct PhotoPicker: UIViewControllerRepresentable {
         let onPick: ([PHPickerResult]) -> Void
         init(onPick: @escaping ([PHPickerResult]) -> Void) { self.onPick = onPick }
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) { onPick(results); picker.dismiss(animated: true) }
+    }
+}
+
+/// 系统文件多选（文档选择器，asCopy 落到本地临时副本）
+struct DocPicker: UIViewControllerRepresentable {
+    let onPick: ([URL]) -> Void
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let pc = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.item], asCopy: true)
+        pc.allowsMultipleSelection = true
+        pc.delegate = context.coordinator
+        return pc
+    }
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+    class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: ([URL]) -> Void
+        init(onPick: @escaping ([URL]) -> Void) { self.onPick = onPick }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onPick(urls) }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
+    }
+}
+
+/// 把收到的非媒体文件导出到「文件」App（用户选存储位置）
+struct DocExportPicker: UIViewControllerRepresentable {
+    let url: URL
+    let fileName: String
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let pc = UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+        pc.delegate = context.coordinator
+        return pc
+    }
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+    class Coordinator: NSObject, UIDocumentPickerDelegate {
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {}
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
     }
 }
 

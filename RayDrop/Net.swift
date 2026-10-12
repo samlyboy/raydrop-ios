@@ -2,10 +2,14 @@ import Foundation
 import Network
 import Darwin
 
-/// 枚举本机 IP（Tailscale 100.x 优先）
+/// 枚举本机 IP。**根治"幽灵 IP"**：只上报当前 Wi-Fi 主接口(en0)的局域网地址 + Tailscale(100.x)。
+/// iOS 有多个虚拟接口（蜂窝 pdp_ip0、VPN ipsec/utun、点对点 awdl/llw、热点 bridge、隧道 gif/stf），
+/// 它们的 IPv4（如蜂窝/VPN 的 10.x）不是当前局域网可达地址——一旦上报给对端，会让对端的
+/// 「局域网 IP」在真实地址与幽灵地址间反复跳变，点到幽灵地址就连不通。
 enum RDIP {
     static func ips() -> [String] {
-        var out: [String] = []
+        // 先收集所有非 lo0 的 IPv4：(接口名, IP)
+        var all: [(String, String)] = []
         var addr: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&addr) == 0 {
             var p = addr
@@ -16,7 +20,7 @@ enum RDIP {
                     if name != "lo0" {
                         var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                         if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
-                            out.append(String(cString: host))
+                            all.append((name, String(cString: host)))
                         }
                     }
                 }
@@ -24,15 +28,23 @@ enum RDIP {
             }
             freeifaddrs(addr)
         }
-        out.sort { a, b in
-            let aT = a.hasPrefix("100."), bT = b.hasPrefix("100.")
-            if aT != bT { return aT }
-            return false
+        let isLinkLocal = { (ip: String) in ip.hasPrefix("169.254.") }
+        // Tailscale：任何接口的 100.x 都保留（单列一组）
+        var ts = all.filter { $0.1.hasPrefix("100.") }.map { $0.1 }
+        // 局域网：优先 Wi-Fi 主接口 en0 的 IPv4（最权威、一定与对端同网段）
+        var lan = all.filter { $0.0 == "en0" && !isLinkLocal($0.1) }.map { $0.1 }
+        // 没有 en0（未连 Wi-Fi）时，退回"排除已知虚拟接口后的其它 IPv4"（如纯蜂窝/热点场景）
+        if lan.isEmpty {
+            let virtual: Set<String> = ["pdp_ip0","pdp_ip1","pdp_ip2","ipsec0","ipsec1",
+                                        "utun0","utun1","utun2","utun3","utun4","utun5",
+                                        "awdl0","llw0","gif0","stf0","bridge0","bridge1"]
+            lan = all.filter { !virtual.contains($0.0) && !isLinkLocal($0.1) && !$0.1.hasPrefix("100.") }.map { $0.1 }
         }
+        var seen = Set<String>(); var out: [String] = []
+        for ip in ts  where seen.insert(ip).inserted { out.append(ip) }
+        for ip in lan where seen.insert(ip).inserted { out.append(ip) }
         return out
     }
-    /// 优先 Tailscale 100.x；没有 Tailscale 时退回局域网 IP —— 否则本机不会注册到 CF 目录，
-    /// 对端就永远查不到我（信任码反向发现通道失效）。
     static func tailscaleIP() -> String { ips().first(where: { $0.hasPrefix("100.") }) ?? ips().first ?? "" }
 }
 
@@ -179,6 +191,8 @@ final class RDReceiver {
     var onStart: (String, Int) -> Void = { _, _ in }                    // 对端名, 文件总数
     var onProgress: (Int, Int, Int, Double) -> Void = { _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 字节/秒
     var onEnd: (Bool, String) -> Void = { _, _ in }
+    var onText: (String, String) -> Void = { _, _ in }                       // 收到文本消息(来自, 文本)
+    var onFileToSave: (String, URL, String, String) -> Void = { _,_,_,_ }    // 非媒体文件(来自, 临时URL, 名, mime)→上层存"文件"App
     private var listener: NWListener?
     private var current: RDStream?
 
@@ -226,6 +240,18 @@ final class RDReceiver {
                 let name = fh["name"] as? String ?? "file\(i)"
                 let size = fh["size"] as? Int ?? 0
                 let mime = fh["mime"] as? String ?? RD.mime(for: name)
+                let kind = fh["kind"] as? String ?? "file"
+
+                if kind == "text" {
+                    // 文本消息：读 size 字节到内存，回调上层弹窗展示（不落盘）
+                    var buf = Data(); var left = size
+                    while left > 0 { let d = try await s.read(min(left, RD.chunkSize)); buf.append(d); left -= d.count }
+                    onText(fromName, String(decoding: buf, as: UTF8.self))
+                    RDWrite.line(s.conn, ["ack": i])
+                    continue
+                }
+
+                let isMedia = mime.hasPrefix("image/") || mime.hasPrefix("video/")
                 let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("rd_\(UUID().uuidString)")
                 FileManager.default.createFile(atPath: tmp.path, contents: nil)
                 let handle = try FileHandle(forWritingTo: tmp)
@@ -242,19 +268,19 @@ final class RDReceiver {
                 }
                 try? handle.close()
 
-                // 必须等相册保存结果再回 ACK，否则发送端会显示"发送成功"而相册里没有
-                let res: (Bool, String) = await withCheckedContinuation { cont in
-                    RDMediaSaver.save(tempFile: tmp, name: name, mime: mime) { ok, err in
-                        cont.resume(returning: (ok, err))
-                    }
-                }
                 var ack: [String: Any] = ["ack": i]
-                if res.0 {
-                    onSaved(fromName, name)
+                if isMedia {
+                    // 必须等相册保存结果再回 ACK，否则发送端会显示"发送成功"而相册里没有
+                    let res: (Bool, String) = await withCheckedContinuation { cont in
+                        RDMediaSaver.save(tempFile: tmp, name: name, mime: mime) { ok, err in
+                            cont.resume(returning: (ok, err))
+                        }
+                    }
+                    if res.0 { onSaved(fromName, name) }
+                    else { saveFailed = true; ack["err"] = "保存到相册失败：\(res.1)"; onStatus("保存失败：\(name)（\(res.1)）") }
                 } else {
-                    saveFailed = true
-                    ack["err"] = "保存到相册失败：\(res.1)"
-                    onStatus("保存失败：\(name)（\(res.1)）")
+                    // 非媒体文件：交给上层 present 保存到"文件"App（存不存由用户决定，故不报失败）
+                    onFileToSave(fromName, tmp, name, mime)
                 }
                 RDWrite.line(s.conn, ack)   // 收完才放行下一个
             }
@@ -269,7 +295,10 @@ final class RDReceiver {
     }
 }
 
-/// TCP 发送端：连接 → 握手 → 逐文件发(等 ACK，单线程保序) → 结束
+/// 发送项：文件(URL) 或 文本(String)
+enum SendItem { case file(URL); case text(String) }
+
+/// TCP 发送端：连接 → 握手 → 逐项发(等 ACK，单线程保序) → 结束
 /// 支持暂停/继续/终止；ACK 里带 err（对方保存失败）时立刻停止并提示。
 final class RDSender {
     var onStatus: (String) -> Void = { _ in }
@@ -291,49 +320,65 @@ final class RDSender {
         onStatus(why); onEnd(false, why); done(false)
     }
 
-    func send(host: String, port: UInt16, peerName: String, files: [URL], done: @escaping (Bool) -> Void) {
+    func send(host: String, port: UInt16, peerName: String, items: [SendItem], done: @escaping (Bool) -> Void) {
         aborted = false; paused = false; finished = false
         let nw = NWEndpoint.Host(host)
         let p = NWEndpoint.Port(rawValue: port)!
         let c = NWConnection(host: nw, port: p, using: .tcp)
         conn = c
         c.stateUpdateHandler = { (st: NWConnection.State) in
-            if case .ready = st { self.doSend(peer: peerName, files: files, done: done) }
+            if case .ready = st { self.doSend(peer: peerName, items: items, done: done) }
             else if case .failed = st { if self.aborted { self.stop("已终止", done) } else { self.stop("连接失败", done) } }
             else if case .cancelled = st { if self.aborted && !self.finished { self.stop("已终止", done) } }
         }
         c.start(queue: DispatchQueue.global())
     }
 
-    private func doSend(peer: String, files: [URL], done: @escaping (Bool) -> Void) {
+    private func doSend(peer: String, items: [SendItem], done: @escaping (Bool) -> Void) {
         Task {
             let s = RDStream(conn!)
             do {
                 RDWrite.line(conn!, ["app": RD.app, "v": RD.ver, "name": RDStore.shared.myName,
-                                      "code": RDStore.shared.myCode, "count": files.count])
+                                      "code": RDStore.shared.myCode, "count": items.count])
                 let repLine = try await s.readLine()
                 guard let repData = repLine.data(using: .utf8),
                       let rep = try? JSONSerialization.jsonObject(with: repData) as? [String: Any],
                       (rep["ok"] as? Bool) == true else {
-                    let reason = repLine.contains("untrusted") ? "对方未信任你的码(请让对方添加你的3位码)" : "被拒绝"
+                    let reason = repLine.contains("untrusted") ? "对方未信任你的码" : "被拒绝"
                     self.stop(reason, done); s.close(); return
                 }
-                self.onStart(peer, files.count)
+                self.onStart(peer, items.count)
 
-                for (i, url) in files.enumerated() {
+                for (i, item) in items.enumerated() {
                     await self.waitIfPaused()
                     if self.aborted { self.stop("已终止", done); s.close(); return }
-                    let name = String(format: "%03d_", i + 1) + url.lastPathComponent
-                    let mime = RD.mime(for: url.lastPathComponent)
-                    let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-                    let size = (attrs[.size] as? Int) ?? 0
-                    RDWrite.lenJSON(conn!, ["name": name, "size": size, "mime": mime, "index": i, "total": files.count])
-                    let handle = try FileHandle(forReadingFrom: url)
+                    var name: String, mime: String, kind: String, size: Int
+                    var handle: FileHandle? = nil
+                    var textData: Data? = nil
+                    switch item {
+                    case .file(let url):
+                        name = String(format: "%03d_", i + 1) + url.lastPathComponent
+                        mime = RD.mime(for: url.lastPathComponent)
+                        kind = "file"
+                        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+                        size = (attrs[.size] as? Int) ?? 0
+                        handle = try FileHandle(forReadingFrom: url)
+                    case .text(let str):
+                        name = String(format: "%03d_", i + 1) + "文本消息.txt"
+                        mime = "text/plain;charset=utf-8"
+                        kind = "text"
+                        textData = Data(str.utf8)
+                        size = textData!.count
+                    }
+                    RDWrite.lenJSON(conn!, ["name": name, "size": size, "mime": mime, "kind": kind, "index": i, "total": items.count])
                     var off = 0, lastTick = Date(), lastB = 0, spd = 0.0
                     while off < size {
                         await self.waitIfPaused()
-                        if self.aborted { try? handle.close(); self.stop("已终止", done); s.close(); return }
-                        let chunk = handle.readData(ofLength: RD.chunkSize)
+                        if self.aborted { try? handle?.close(); self.stop("已终止", done); s.close(); return }
+                        let want = min(RD.chunkSize, size - off)
+                        let chunk: Data
+                        if let h = handle { chunk = h.readData(ofLength: want) }
+                        else { chunk = textData!.subdata(in: off..<(off + want)) }
                         if chunk.isEmpty { break }
                         try await self.sendChunk(chunk)   // 背压：等这块发完再发下一块
                         off += chunk.count
@@ -341,10 +386,10 @@ final class RDSender {
                         if dt >= 0.2 {
                             spd = Double(off - lastB) / dt
                             lastTick = now; lastB = off
-                            self.onProgress(i + 1, files.count, off, spd)
+                            self.onProgress(i + 1, items.count, off, spd)
                         }
                     }
-                    try? handle.close()
+                    try? handle?.close()
                     let ackLine = try await s.readLine()   // ACK：收完才发下一个
                     if let d = ackLine.data(using: .utf8),
                        let a = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -356,7 +401,7 @@ final class RDSender {
                 RDWrite.line(conn!, ["done": true])
                 _ = try? await s.readLine()
                 self.finished = true
-                self.onStatus("发送完成：\(files.count) 个文件")
+                self.onStatus("发送完成：\(items.count) 项")
                 self.onEnd(true, "发送完成")
                 done(true)
             } catch {
