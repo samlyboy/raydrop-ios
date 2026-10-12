@@ -15,7 +15,23 @@ if [ -n "$APP_SHARE" ]; then
   mkdir -p "$APP/PlugIns"
   rm -rf "$APP/PlugIns/RayDropShare.appex"
   cp -R "$APP_SHARE" "$APP/PlugIns/"
-  echo "=== embedded share extension from: $APP_SHARE ==="
+
+  # 校验：扩展 Info.plist 必须有 CFBundleExecutable / CFBundleIdentifier，
+  # 否则 TrollStore 递归签名时 ldid 报 "Cannot find key CFBundleExecutable"，
+  # 整个安装失败并返回 175。这里提前发现并给出明确报错。
+  SE_PLIST="$APP/PlugIns/RayDropShare.appex/Info.plist"
+  for key in CFBundleExecutable CFBundleIdentifier CFBundlePackageType NSExtension; do
+    if ! /usr/libexec/PlistBuddy -c "Print :$key" "$SE_PLIST" >/dev/null 2>&1; then
+      echo "ERROR: 分享扩展 Info.plist 缺少必需键 $key —— 会导致 TrollStore 安装失败(175)"
+      exit 1
+    fi
+  done
+  EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$SE_PLIST")
+  if [ ! -f "$APP/PlugIns/RayDropShare.appex/$EXE" ]; then
+    echo "ERROR: 扩展可执行文件不存在：$APP/PlugIns/RayDropShare.appex/$EXE"
+    exit 1
+  fi
+  echo "=== embedded share extension from: $APP_SHARE (exe=$EXE, plist keys OK) ==="
 else
   echo "WARN: RayDropShare.appex not found — 分享扩展不会被包含"
 fi

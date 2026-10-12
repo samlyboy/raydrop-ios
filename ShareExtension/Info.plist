@@ -2,6 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- 注意：CFBundleExecutable 必需！TrollStore 递归签 .app 时会读每个 bundle 的 Info.plist，
+	     缺这个键 ldid 会报 "Cannot find key CFBundleExecutable" 并导致整个安装失败(175)。
+	     扩展的可执行文件名与 PRODUCT_NAME 一致（RayDropShare），由 xcodebuild 展开 $(EXECUTABLE_NAME)。 -->
+	<key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
+	<key>CFBundleDisplayName</key><string>RayDrop锐传</string>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundlePackageType</key><string>XPC!</string>
+	<key>CFBundleShortVersionString</key><string>15.0</string>
+	<key>CFBundleVersion</key><string>15</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>

@@ -354,16 +354,11 @@ struct ContentView: View {
             Button("复制") { UIPasteboard.general.string = engine.receivedText }
             Button("关闭", role: .cancel) {}
         } message: { Text(engine.receivedText) }
-        .alert("设备名称", isPresented: $editName) {
-            Button("取消", role: .cancel) {}
-            Button("确认") { engine.setName(editNameDraft) }
-        } message: {
-            // iOS 15 的 .alert 不支持直接放 TextField（会不弹输入框），改用下方 sheet 弹窗
-            Text(engine.myName)
-        }
         .sheet(isPresented: $engine.showSaveFile) {
             if let u = engine.saveFileURL { DocExportPicker(url: u) }
         }
+        // 改名只用 sheet：iOS 15 的 .alert 无法承载 TextField（会只弹按钮没有输入框），
+        // 且同一个 Bool 同时驱动 alert 与 sheet 时 alert 会抢先弹出把 sheet 挡住。
         .sheet(isPresented: $editName) {
             NameEditSheet(name: $editNameDraft) { txt in
                 if !txt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { engine.setName(txt) }
