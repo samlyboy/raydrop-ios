@@ -80,6 +80,7 @@ final class RDDiscovery {
         let me: [String: Any] = [
             "app": RD.app, "v": 2, "name": RDStore.shared.myName,
             "code": RDStore.shared.myCode, "did": RDStore.shared.deviceId,
+            "platform": "iOS",
             "port": Int(RD.tcpPort), "ips": RDIP.ips()
         ]
         return try? JSONSerialization.data(withJSONObject: me)
@@ -207,7 +208,7 @@ final class RDReceiver {
             }
             l.start(queue: DispatchQueue.global())
             listener = l
-            onStatus("接收服务已开启 · 码 \(RDStore.shared.myCode)")
+            onStatus("接收服务已开启")
         } catch {
             onStatus("接收端口错误: \(error.localizedDescription)")
         }

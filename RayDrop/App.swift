@@ -5,19 +5,18 @@ import UniformTypeIdentifiers
 import UIKit
 
 final class Engine: ObservableObject {
-    /// 设备记录：id 用稳定标识（did）而不是 3 位码 —— 对方改了码也还是同一台设备，不会多出一条。
-    /// 一台设备可能同时有局域网 IP 和 Tailscale IP，两个都存，列表里分组展示由用户选走哪条。
     struct DeviceInfo: Identifiable {
         var id: String
         var code: String
         var name: String
+        var platform: String     // iOS / Android / PC，驱动设备图标
         var lanHost: String
         var tsHost: String
         var port: UInt16
         var lastSeen: Date
+        /// 手机 vs 电脑图标
+        var isComputer: Bool { platform.lowercased().contains("pc") || platform.lowercased().contains("mac") }
     }
-
-    /// 任务列表条目：header=true 是带时间戳的分隔行
     struct LogEntry: Identifiable { let id = UUID(); let text: String; let inColor: Color; let isHeader: Bool }
 
     @Published var status = "启动中…"
@@ -25,16 +24,14 @@ final class Engine: ObservableObject {
     @Published var myCode = RDStore.shared.myCode
     @Published var myName = RDStore.shared.myName
     @Published var devices: [DeviceInfo] = []
-    @Published var selectedTarget: DeviceInfo?
-    /// 传输进度：如「(3/6) ↑上传 1.2 MB/s」；接收方向显示 ↓下载
     @Published var progress = ""
     @Published var txActive = false
     @Published var paused = false
-    /// 收到的文本消息（弹窗展示 + 复制）
+    /// 已选待发送内容的摘要，如「已选 3 项」
+    @Published var pendingSummary = ""
     @Published var receivedFrom = ""
     @Published var receivedText = ""
     @Published var showRecvText = false
-    /// 收到的非媒体文件 → 弹出「存储到文件」
     @Published var saveFileURL: URL? = nil
     @Published var saveFileName = ""
     @Published var showSaveFile = false
@@ -43,31 +40,28 @@ final class Engine: ObservableObject {
     private let discovery = RDDiscovery()
     private let sender = RDSender()
     private var txUp = false, txTotal = 0, txPeer = "对方"
+    private var pendingItems: [SendItem] = []
+    private var didStart = false
 
-    static let cIn = Color(red: 0.90, green: 0.22, blue: 0.21)     // 接收：红
-    static let cOut = Color(red: 0.18, green: 0.60, blue: 0.24)    // 发送：绿
+    static let cIn = Color(red: 0.90, green: 0.22, blue: 0.21)
+    static let cOut = Color(red: 0.18, green: 0.60, blue: 0.24)
     static let cSys = Color.secondary
+    private static let fmtTime: DateFormatter = { let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"; return f }()
 
-    private static let fmtTime: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"; return f
-    }()
-    /// 新条目插在最前面（新的在上面）
+    /// 新条目插在「当前批次时间戳分隔行」之下；没有分隔行则插最顶。
+    /// 不再有"批次结束就释放"的逻辑——一旦某批次插了时间戳，它就钉在该批最上方，永不被后续条目挤到下面。
     private func addEntry(_ text: String, _ color: Color, header: Bool = false) {
         DispatchQueue.main.async {
-            // 批次进行中：新条目插在时间戳分隔行下方，让分隔行始终钉在每批任务的顶部
-            let at = (self.pinHeader && !self.logEntries.isEmpty && self.logEntries[0].isHeader && !header) ? 1 : 0
+            let at: Int
+            if header { at = 0 }
+            else if self.logEntries.first?.isHeader == true { at = 1 }
+            else { at = 0 }
             self.logEntries.insert(LogEntry(text: text, inColor: color, isHeader: header), at: at)
             if self.logEntries.count > 300 { self.logEntries.removeLast(self.logEntries.count - 300) }
         }
     }
     private func addLog(_ text: String) { addEntry(text, Engine.cSys) }
-    /// 每轮传输插入一条带时间戳的分隔行，钉在该批任务顶部（新条目都插在它下面）
-    private func addHeader(_ title: String) {
-        pinHeader = true
-        addEntry(Engine.fmtTime.string(from: Date()) + "  " + title, Engine.cSys, header: true)
-    }
-    /// 批次进行中标记：结束（完成/失败/终止）后释放，后续新条目回到最顶上
-    private var pinHeader = false
+    private func addHeader(_ title: String) { addEntry(Engine.fmtTime.string(from: Date()) + "  " + title, Engine.cSys, header: true) }
 
     static func fmtSpeed(_ bps: Double) -> String {
         if bps >= 1048576 { return String(format: "%.1f MB/s", bps / 1048576) }
@@ -92,7 +86,6 @@ final class Engine: ObservableObject {
     private func endTx(ok: Bool, msg: String) {
         DispatchQueue.main.async {
             self.txActive = false; self.paused = false
-            self.pinHeader = false   // 批次结束，分隔行不再钉顶
             if ok && self.txTotal > 0 { self.progress = "(\(self.txTotal)/\(self.txTotal)) 完成" }
             else if msg != "接收中断" && !msg.hasPrefix("已终止") { self.progress = "" }
         }
@@ -105,15 +98,12 @@ final class Engine: ObservableObject {
     func abortTx() {
         if txUp { sender.abort() } else { receiver.abort() }
         txActive = false; paused = false; progress = ""
-        pinHeader = false   // 批次被终止，分隔行不再钉顶
     }
 
     func start() {
+        if didStart { return }; didStart = true
         receiver.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
-        receiver.onSaved = { [weak self] from, name in
-            // 接收：红色「一加 → 本机  003_001_xxx.jpg」
-            self?.addEntry("\(from) → 本机  \(name)", Engine.cIn)
-        }
+        receiver.onSaved = { [weak self] from, name in self?.addEntry("\(from) → 本机  \(name)", Engine.cIn) }
         receiver.onText = { [weak self] from, text in
             DispatchQueue.main.async {
                 self?.receivedFrom = from.isEmpty ? "对方" : from
@@ -136,13 +126,9 @@ final class Engine: ObservableObject {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.status = s
-                // 发送成功一个：绿色「本机 → 一加  003_001_xxx」
                 if s.hasPrefix("已发送 ") {
-                    let name = String(s.dropFirst("已发送 ".count))
-                    self.addEntry("本机 → \(self.txPeer)  \(name)", Engine.cOut)
-                } else {
-                    self.addLog(s)
-                }
+                    self.addEntry("本机 → \(self.txPeer)  \(String(s.dropFirst("已发送 ".count)))", Engine.cOut)
+                } else { self.addLog(s) }
             }
         }
         sender.onStart = { [weak self] peer, total in self?.beginTx(up: true, peer: peer, total: total) }
@@ -155,46 +141,35 @@ final class Engine: ObservableObject {
     private func ingest(_ o: [String: Any]) {
         guard let code = o["code"] as? String else { return }
         let name = o["name"] as? String ?? "设备"
+        let platform = o["platform"] as? String ?? ""
         let ips = o["ips"] as? [String] ?? []
         let port = UInt16((o["port"] as? NSNumber)?.intValue ?? Int(RD.tcpPort))
-        // 地址实时分类：ips 是对方当下网卡快照（每次告知都重新枚举）；srcIP 是报文实际来源，最权威
         var lan = "", ts = ""
         for ip in ips { if ip.hasPrefix("100.") { if ts.isEmpty { ts = ip } } else if lan.isEmpty { lan = ip } }
         let src = o["srcIP"] as? String ?? ""
         if !src.isEmpty { if src.hasPrefix("100.") { ts = src } else { lan = src } }
         let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
-        upsert(id: did, code: code, name: name, lanHost: lan, tsHost: ts, port: port)
-        discovery.announceTo(src.isEmpty ? [] : [src])   // 回告报文来源，对方立刻能看到我
+        upsert(id: did, code: code, name: name, platform: platform, lanHost: lan, tsHost: ts, port: port)
+        discovery.announceTo(src.isEmpty ? [] : [src])
         syncTargets()
     }
-
-    /// 合并规则：did → 同名同 IP（对方改码后仍视为同一台设备）。
-    /// 地址实时覆盖：本次告知快照里没有的地址一律清掉，杜绝陈旧 IP 缓存。
-    private func upsert(id: String, code: String, name: String, lanHost: String, tsHost: String, port: UInt16) {
+    private func upsert(id: String, code: String, name: String, platform: String, lanHost: String, tsHost: String, port: UInt16) {
         var idx = devices.firstIndex { $0.id == id }
         if idx == nil { idx = devices.firstIndex { $0.code == code } }
         if idx == nil, !lanHost.isEmpty { idx = devices.firstIndex { $0.name == name && $0.lanHost == lanHost } }
-        if idx == nil, !tsHost.isEmpty { idx = devices.firstIndex { $0.name == name && $0.tsHost == tsHost } }
         if let i = idx {
-            devices[i].id = id.hasPrefix("cf:") ? devices[i].id : id    // 真 did 优先
-            devices[i].code = code
-            devices[i].name = name
-            devices[i].lanHost = lanHost
-            devices[i].tsHost = tsHost
-            devices[i].port = port
-            devices[i].lastSeen = Date()
+            devices[i].id = id.hasPrefix("cf:") ? devices[i].id : id
+            devices[i].code = code; devices[i].name = name; devices[i].platform = platform
+            devices[i].lanHost = lanHost; devices[i].tsHost = tsHost; devices[i].port = port; devices[i].lastSeen = Date()
         } else {
-            devices.append(DeviceInfo(id: id, code: code, name: name, lanHost: lanHost, tsHost: tsHost, port: port, lastSeen: Date()))
+            devices.append(DeviceInfo(id: id, code: code, name: name, platform: platform, lanHost: lanHost, tsHost: tsHost, port: port, lastSeen: Date()))
         }
     }
-
     private func syncTargets() {
         var all: [String] = []
         for d in devices { if !d.lanHost.isEmpty { all.append(d.lanHost) }; if !d.tsHost.isEmpty { all.append(d.tsHost) } }
         discovery.setExtraTargets(all)
     }
-
-    /// 清理：45s 没消息就下线（对方改码/重启后的旧条目靠这个自动消失）。
     private func cull() {
         let now = Date()
         let kept = devices.filter { now.timeIntervalSince($0.lastSeen) < 45 }
@@ -210,10 +185,14 @@ final class Engine: ObservableObject {
     }
     func setName(_ n: String) { RDStore.shared.myName = n; myName = n }
 
-    /// 发送相册：按用户在相册里选择的顺序逐个导出并保序传输。
-    func send(to dev: DeviceInfo, host: String, results: [PHPickerResult], completion: @escaping () -> Void) {
-        let group = DispatchGroup()
-        let lock = NSLock()
+    // ---- 顶部选类型/内容 → 暂存 ----
+    func setPending(_ items: [SendItem], summary: String) {
+        pendingItems = items
+        DispatchQueue.main.async { self.pendingSummary = items.isEmpty ? "" : summary }
+    }
+    func preparePhotos(_ results: [PHPickerResult]) {
+        guard !results.isEmpty else { return }
+        let group = DispatchGroup(); let lock = NSLock()
         var urls: [URL?] = Array(repeating: nil, count: results.count)
         for (idx, r) in results.enumerated() {
             let provider = r.itemProvider
@@ -222,30 +201,26 @@ final class Engine: ObservableObject {
             group.enter()
             provider.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
                 defer { group.leave() }
-                if let url {
-                    let tmp = self.copyTemp(url)
-                    lock.lock(); urls[idx] = tmp; lock.unlock()
-                }
+                if let url { let tmp = self.copyTemp(url); lock.lock(); urls[idx] = tmp; lock.unlock() }
             }
         }
         group.notify(queue: .global()) {
             let final = urls.compactMap { $0 }
-            guard !final.isEmpty else { return }
-            self.sender.send(host: host, port: dev.port, peerName: dev.name, items: final.map { .file($0) }) { _ in completion() }
+            self.setPending(final.map { .file($0) }, summary: "已选 \(final.count) 张照片/视频")
         }
     }
 
-    /// 发送系统文件（来自文档选择器的 URL，asCopy 已在本地）
-    func sendFiles(to dev: DeviceInfo, host: String, urls: [URL], completion: @escaping () -> Void) {
-        guard !urls.isEmpty else { return }
-        sender.send(host: host, port: dev.port, peerName: dev.name, items: urls.map { .file($0) }) { _ in completion() }
+    /// 点设备 → 发送暂存内容（先选类型内容，再点设备发出）
+    func sendPending(to dev: DeviceInfo, host: String) {
+        if pendingItems.isEmpty {
+            DispatchQueue.main.async { self.status = "请先在顶部选择要发送的内容（照片/文件/文本）" }
+            return
+        }
+        let items = pendingItems
+        sender.send(host: host, port: dev.port, peerName: dev.name, items: items) { _ in
+            DispatchQueue.main.async { self.pendingItems = []; self.pendingSummary = "" }
+        }
     }
-
-    /// 发送文本消息
-    func sendText(to dev: DeviceInfo, host: String, text: String, completion: @escaping () -> Void) {
-        sender.send(host: host, port: dev.port, peerName: dev.name, items: [.text(text)]) { _ in completion() }
-    }
-
     private func copyTemp(_ src: URL) -> URL {
         let dst = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + src.lastPathComponent)
         try? FileManager.default.copyItem(at: src, to: dst)
@@ -253,124 +228,190 @@ final class Engine: ObservableObject {
     }
 }
 
+// MARK: - 主界面（发送类型 → 设备 → 状态）
 struct ContentView: View {
     @StateObject var engine = Engine()
-    @State var showPicker = false
-    @State var showDocPicker = false
-    @State var showTextInput = false
+    @State var showPhoto = false
+    @State var showDoc = false
+    @State var showText = false
     @State var textDraft = ""
-    @State var selectedHost = ""
 
     var body: some View {
         NavigationView {
-            Form {
-                Section("我的码 / 名称") {
-                    TextField("3位数字码", text: Binding(get: { engine.myCode }, set: { engine.setCode($0) })).keyboardType(.numberPad)
-                    TextField("设备名称", text: Binding(get: { engine.myName }, set: { engine.setName($0) }))
-                }
-                // 分两组：同一台机器两条通道就出现两次（局域网一行、Tailscale 一行），由用户选走哪条
-                Section("【局域网】设备") {
-                    let rows = engine.devices.filter { !$0.lanHost.isEmpty }
-                    if rows.isEmpty { Text("（无）").foregroundColor(.gray) }
-                    ForEach(rows) { d in devRow(d, host: d.lanHost) }
-                }
-                Section("【Tailscale】设备") {
-                    let rows = engine.devices.filter { !$0.tsHost.isEmpty }
-                    if rows.isEmpty { Text("（无）").foregroundColor(.gray) }
-                    ForEach(rows) { d in devRow(d, host: d.tsHost) }
-                }
-                if engine.devices.isEmpty {
-                    Section { Text("未发现设备，等待广播/探测…").foregroundColor(.gray) }
-                }
-                // 发送类型：先在设备列表「选此设备」，再选发相册/发文本/发文件
-                Section("发送") {
-                    if let t = engine.selectedTarget {
-                        Text("目标：\(t.name) [\(t.code)] · \(selectedHost)").font(.caption).foregroundColor(.secondary)
-                    } else {
-                        Text("请先在设备列表点「选此设备」").font(.caption).foregroundColor(.gray)
-                    }
-                    HStack {
-                        Button("发相册") { showPicker = true }.disabled(engine.selectedTarget == nil)
-                        Button("发文本") { showTextInput = true }.disabled(engine.selectedTarget == nil)
-                        Button("发文件") { showDocPicker = true }.disabled(engine.selectedTarget == nil)
-                    }
-                }
-                Section("状态") {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(engine.status).font(.footnote)
-                        Spacer(minLength: 8)
-                        if !engine.progress.isEmpty { Text(engine.progress).font(.footnote).foregroundColor(.secondary) }
-                    }
-                    if engine.txActive {
-                        HStack {
-                            Button(engine.paused ? "继续" : "暂停") { engine.togglePause() }.buttonStyle(.bordered)
-                            Button("终止", role: .destructive) { engine.abortTx() }.buttonStyle(.bordered)
-                            Spacer()
-                        }
-                    }
-                    if !engine.logEntries.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(engine.logEntries) { e in
-                                if e.isHeader {
-                                    VStack(spacing: 2) {
-                                        Divider()
-                                        Text(e.text).font(.caption2).foregroundColor(.secondary)
-                                        Divider()
-                                    }
-                                } else {
-                                    Text(e.text).font(.caption).foregroundColor(e.inColor)
-                                }
-                            }
-                        }
-                    }
-                }
+            VStack(spacing: 0) {
+                header
+                Divider()
+                kindBar
+                if !engine.pendingSummary.isEmpty { pendingHint }
+                Divider()
+                deviceList
+                Divider()
+                transferBar
+                Divider()
+                logView
             }
-            .navigationTitle("RayDrop 锐传 v9")
+            .navigationTitle("RayDrop锐传")
+            .navigationBarTitleDisplayMode(.inline)
         }
-        // 相册选择
-        .sheet(isPresented: $showPicker) {
-            PhotoPicker { results in
-                if let t = engine.selectedTarget { engine.send(to: t, host: selectedHost, results: results) {} }
+        .sheet(isPresented: $showPhoto) {
+            PhotoPicker { results in engine.preparePhotos(results); showPhoto = false }
+        }
+        .sheet(isPresented: $showDoc) {
+            DocPicker { urls in engine.setPending(urls.map { .file($0) }, summary: "已选 \(urls.count) 个文件"); showDoc = false }
+        }
+        .sheet(isPresented: $showText) {
+            TextInputSheet(text: $textDraft) { txt in
+                engine.setPending([.text(txt)], summary: "已选 1 段文本"); showText = false; textDraft = ""
             }
         }
-        // 系统文件选择
-        .sheet(isPresented: $showDocPicker) {
-            DocPicker { urls in
-                if let t = engine.selectedTarget { engine.sendFiles(to: t, host: selectedHost, urls: urls) {} }
-            }
-        }
-        // 发送文本输入
-        .alert("发送文本 → \(selectedHost)", isPresented: $showTextInput) {
-            TextEditor(text: $textDraft).frame(height: 160)
-            Button("发送") {
-                let txt = textDraft
-                textDraft = ""
-                if let t = engine.selectedTarget { engine.sendText(to: t, host: selectedHost, text: txt) {} }
-            }
-            Button("取消", role: .cancel) { textDraft = "" }
-        } message: { Text("输入要发送的文字资料") }
-        // 收到文本消息
         .alert("文本来自 \(engine.receivedFrom)", isPresented: $engine.showRecvText) {
             Button("复制") { UIPasteboard.general.string = engine.receivedText }
             Button("关闭", role: .cancel) {}
         } message: { Text(engine.receivedText) }
-        // 收到非媒体文件 → 存储到「文件」App
         .sheet(isPresented: $engine.showSaveFile) {
-            if let u = engine.saveFileURL { DocExportPicker(url: u, fileName: engine.saveFileName) }
+            if let u = engine.saveFileURL { DocExportPicker(url: u) }
         }
         .onAppear { engine.start() }
     }
 
-    @ViewBuilder private func devRow(_ d: Engine.DeviceInfo, host: String) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) { Text(d.name + " [" + d.code + "]").font(.headline); Text(host).font(.caption).foregroundColor(.gray) }
-            Spacer()
-            Button("选此设备") { engine.selectedTarget = d; selectedHost = host }.font(.caption)
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("RayDrop锐传").font(.title3.bold())
+            HStack {
+                Text("码 \(engine.myCode)").font(.title3.monospacedDigit().weight(.semibold))
+                Spacer()
+            }
+            TextField("设备名称", text: Binding(get: { engine.myName }, set: { engine.setName($0) }))
+                .textFieldStyle(.roundedBorder).font(.subheadline)
+        }
+        .padding(.horizontal).padding(.top, 6)
+    }
+
+    private var kindBar: some View {
+        HStack(spacing: 0) {
+            KindButton(icon: "photo", title: "照片", tint: .blue) { showPhoto = true }
+            KindButton(icon: "folder", title: "文件", tint: .green) { showDoc = true }
+            KindButton(icon: "textformat", title: "文本", tint: .orange) { showText = true }
+        }
+        .padding(.vertical, 8)
+    }
+    private var pendingHint: some View {
+        HStack(spacing: 4) { Image(systemName: "checkmark.circle.fill").foregroundColor(.green); Text(engine.pendingSummary).font(.caption) }
+            .padding(.horizontal).padding(.bottom, 4)
+    }
+
+    private var deviceList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                if engine.devices.isEmpty {
+                    Text("未发现设备，等待广播/探测…").foregroundColor(.gray).font(.footnote).padding(.horizontal)
+                } else {
+                    let lan = engine.devices.filter { !$0.lanHost.isEmpty }
+                    let ts = engine.devices.filter { !$0.tsHost.isEmpty }
+                    if !lan.isEmpty {
+                        Text("【局域网】").font(.caption2).foregroundColor(.secondary).padding(.horizontal)
+                        ForEach(lan) { devRow($0, $0.lanHost) }
+                    }
+                    if !ts.isEmpty {
+                        Text("【Tailscale】").font(.caption2).foregroundColor(.secondary).padding(.horizontal).padding(.top, 4)
+                        ForEach(ts) { devRow($0, $0.tsHost) }
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+    private func devRow(_ d: Engine.DeviceInfo, _ host: String) -> some View {
+        Button { engine.sendPending(to: d, host: host) } label: {
+            HStack(spacing: 10) {
+                Image(systemName: d.isComputer ? "desktopcomputer" : "iphone")
+                    .font(.title3).frame(width: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(d.name) [\(d.code)]").font(.subheadline.weight(.medium))
+                    Text(host).font(.caption2).foregroundColor(.secondary)
+                }
+                Spacer()
+                Image(systemName: "arrow.up.circle.fill").foregroundColor(.accentColor)
+            }
+            .padding(.horizontal).padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var transferBar: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(engine.status).font(.caption).lineLimit(1)
+                Spacer()
+                if !engine.progress.isEmpty { Text(engine.progress).font(.caption).foregroundColor(.secondary) }
+            }
+            if engine.txActive {
+                HStack(spacing: 10) {
+                    Button(engine.paused ? "继续" : "暂停") { engine.togglePause() }.buttonStyle(.bordered).controlSize(.small)
+                    Button("终止", role: .destructive) { engine.abortTx() }.buttonStyle(.bordered).controlSize(.small)
+                }
+            }
+        }
+        .padding(.horizontal).padding(.vertical, 5)
+    }
+
+    private var logView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(engine.logEntries) { e in
+                    if e.isHeader {
+                        Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1)
+                        Text(e.text).font(.caption2).foregroundColor(.secondary)
+                        Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1)
+                    } else {
+                        Text(e.text).font(.caption2).foregroundColor(e.inColor)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal).padding(.vertical, 4)
         }
     }
 }
 
-/// 相册多选
+/// 发送类型按钮（图标 + 文字）
+struct KindButton: View {
+    let icon: String; let title: String; let tint: Color; let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 26, weight: .semibold)).foregroundColor(tint)
+                Text(title).font(.caption)
+            }
+            .frame(maxWidth: .infinity).padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 文本输入面板（多行，避免 alert 不支持输入控件）
+struct TextInputSheet: View {
+    @Binding var text: String
+    let onSend: (String) -> Void
+    @Environment(\.presentationMode) var pm
+    var body: some View {
+        NavigationView {
+            TextEditor(text: $text).padding(6).frame(maxWidth: .infinity, maxHeight: .infinity)
+                .navigationTitle("输入要发送的文本").navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("取消") { pm.dismiss() } }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("确定") {
+                            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { onSend(text) } else { pm.dismiss() }
+                        }
+                    }
+                }
+        }
+    }
+}
+
 struct PhotoPicker: UIViewControllerRepresentable {
     let onPick: ([PHPickerResult]) -> Void
     func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
@@ -385,40 +426,31 @@ struct PhotoPicker: UIViewControllerRepresentable {
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) { onPick(results); picker.dismiss(animated: true) }
     }
 }
-
-/// 系统文件多选（文档选择器，asCopy 落到本地临时副本）
 struct DocPicker: UIViewControllerRepresentable {
     let onPick: ([URL]) -> Void
     func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let pc = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.item], asCopy: true)
-        pc.allowsMultipleSelection = true
-        pc.delegate = context.coordinator
-        return pc
+        pc.allowsMultipleSelection = true; pc.delegate = context.coordinator; return pc
     }
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
     class Coordinator: NSObject, UIDocumentPickerDelegate {
         let onPick: ([URL]) -> Void
         init(onPick: @escaping ([URL]) -> Void) { self.onPick = onPick }
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onPick(urls) }
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
+        func documentPicker(_ c: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onPick(urls) }
+        func documentPickerWasCancelled(_ c: UIDocumentPickerViewController) {}
     }
 }
-
-/// 把收到的非媒体文件导出到「文件」App（用户选存储位置）
 struct DocExportPicker: UIViewControllerRepresentable {
     let url: URL
-    let fileName: String
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let pc = UIDocumentPickerViewController(forExporting: [url], asCopy: true)
-        pc.delegate = context.coordinator
-        return pc
+        let pc = UIDocumentPickerViewController(forExporting: [url], asCopy: true); pc.delegate = context.coordinator; return pc
     }
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
     class Coordinator: NSObject, UIDocumentPickerDelegate {
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {}
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
+        func documentPicker(_ c: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {}
+        func documentPickerWasCancelled(_ c: UIDocumentPickerViewController) {}
     }
 }
 
