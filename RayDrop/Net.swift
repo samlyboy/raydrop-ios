@@ -2,10 +2,21 @@ import Foundation
 import Network
 import Darwin
 
-/// 枚举本机 IP。**根治"幽灵 IP"**：只上报当前 Wi-Fi 主接口(en0)的局域网地址 + Tailscale(100.x)。
-/// iOS 有多个虚拟接口（蜂窝 pdp_ip0、VPN ipsec/utun、点对点 awdl/llw、热点 bridge、隧道 gif/stf），
+/// 枚举本机 IP。**根治"幽灵 IP"**：只上报当前 Wi-Fi 主接口(en0)的局域网地址 + Tailscale(100.x)。/// iOS 有多个虚拟接口（蜂窝 pdp_ip0、VPN ipsec/utun、点对点 awdl/llw、热点 bridge、隧道 gif/stf），
 /// 它们的 IPv4（如蜂窝/VPN 的 10.x）不是当前局域网可达地址——一旦上报给对端，会让对端的
 /// 「局域网 IP」在真实地址与幽灵地址间反复跳变，点到幽灵地址就连不通。
+/// 去掉发送端为排序加的 "%03d_" 序号前缀（"001_1.apk" → "1.apk"），
+/// 真实以序号开头的文件（如 "3gp_素材.mp4"）不受影响。
+func stripOrderPrefix(_ name: String) -> String {
+    let parts = name.split(separator: " ", maxSplits: 1).map(String.init)
+    // 去掉前缀后仍需带扩展名，避免把无扩展名文件误判
+    if parts.count == 2 {
+        let tail = parts[1]
+        if (tail as NSString).pathExtension.isEmpty == false { return tail }
+    }
+    return name
+}
+
 enum RDIP {
     static func ips() -> [String] {
         // 先收集所有非 lo0 的 IPv4：(接口名, IP)
@@ -238,7 +249,9 @@ final class RDReceiver {
 
             for i in 0..<count {
                 let fh = try await s.readLenJSON()
-                let name = fh["name"] as? String ?? "file\(i)"
+                // 发送端为排序加的 "%03d_" 序号前缀要去掉，接收方文件名与发送端原名保持一致
+                let rawName = fh["name"] as? String ?? "file\(i)"
+                let name = RD.stripOrderPrefix(rawName)
                 let size = fh["size"] as? Int ?? 0
                 let mime = fh["mime"] as? String ?? RD.mime(for: name)
                 let kind = fh["kind"] as? String ?? "file"
@@ -280,8 +293,13 @@ final class RDReceiver {
                     if res.0 { onSaved(fromName, name) }
                     else { saveFailed = true; ack["err"] = "保存到相册失败：\(res.1)"; onStatus("保存失败：\(name)（\(res.1)）") }
                 } else {
-                    // 非媒体文件：交给上层 present 保存到"文件"App（存不存由用户决定，故不报失败）
-                    onFileToSave(fromName, tmp, name, mime)
+                    // 非媒体文件：临时文件先改成真实文件名（带扩展名），再交给上层 present 保存到"文件"App。
+                    // 否则导出时只会看到 rd_<UUID> 这种无扩展名临时名。存不存由用户决定，故不报失败。
+                    let real = RD.tempURL(named: name)
+                    try? FileManager.default.removeItem(at: real)
+                    do { try FileManager.default.moveItem(at: tmp, to: real) }
+                    catch { onStatus("临时文件改名失败：\(error.localizedDescription)") }
+                    onFileToSave(fromName, real, name, mime)
                 }
                 RDWrite.line(s.conn, ack)   // 收完才放行下一个
             }
