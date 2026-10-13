@@ -65,6 +65,8 @@ final class Engine: ObservableObject {
     private var txUp = false, txTotal = 0, txPeer = "对方"
     private var pendingItems: [SendItem] = []
     private var didStart = false
+    /// 跨 Tailscale 发现：从 Tailscale API 拉到的 tailnet 设备 100.x（非本机），作为单播探测目标
+    private var tsTargets: [String] = []
 
     static let cIn = Color(red: 0.90, green: 0.22, blue: 0.21)
     static let cOut = Color(red: 0.18, green: 0.60, blue: 0.24)
@@ -170,6 +172,9 @@ final class Engine: ObservableObject {
         sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         receiver.start(); discovery.start()
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.cull() }
+        // 跨 Tailscale 发现（手机↔手机纯 TS）：周期拉 tailnet 设备 100.x → 单播探测目标
+        refreshTailscale()
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshTailscale() }
     }
 
     private func ingest(_ o: [String: Any]) {
@@ -236,7 +241,19 @@ final class Engine: ObservableObject {
     private func syncTargets() {
         var all: [String] = []
         for d in devices { if !d.lanHost.isEmpty { all.append(d.lanHost) }; if !d.tsHost.isEmpty { all.append(d.tsHost) } }
+        all.append(contentsOf: tsTargets)   // 跨 Tailscale 拉到的 tailnet 设备 100.x 也作为单播探测目标
         discovery.setExtraTargets(all)
+    }
+
+    /// 用内嵌 OAuth client 拉取 tailnet 在线设备的 100.x 地址，刷新单播探测目标
+    private func refreshTailscale() {
+        DispatchQueue.global().async {
+            let addrs = Tailscale.shared.peerTSAddresses()
+            DispatchQueue.main.async {
+                self.tsTargets = addrs
+                self.syncTargets()
+            }
+        }
     }
     private func cull() {
         let now = Date()
