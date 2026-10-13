@@ -513,16 +513,8 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button { openFiles() } label: { Label("打开「下载」文件夹", systemImage: "folder") }
-                        Button { engine.exportLastReceived() } label: {
-                            Label(engine.lastReceivedName.isEmpty ? "另存最近接收的文件…" : "另存「\(engine.lastReceivedName)」…",
-                                  systemImage: "square.and.arrow.up")
-                        }
-                        .disabled(engine.lastReceivedFile == nil)
-                    } label: {
-                        Label("下载", systemImage: "folder")
-                    }
+                    // ★ 单击直达：一下点开系统「文件」App（不再折叠成菜单，少一次点击）
+                    Button(action: openFiles) { Label("打开文件浏览器", systemImage: "folder") }
                 }
             }
         }
