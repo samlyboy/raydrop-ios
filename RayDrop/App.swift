@@ -63,8 +63,9 @@ final class Engine: ObservableObject {
     @Published var receivedFrom = ""
     @Published var receivedText = ""
     @Published var showRecvText = false
-    @Published var saveFileURL: URL? = nil
-    @Published var saveFileName = ""
+    /// ★ 最近一次收到的文件（已自动落在「下载」里）；仅用于「另存为…」这个可选出口（默认无需任何操作）
+    @Published var lastReceivedFile: URL? = nil
+    @Published var lastReceivedName = ""
     @Published var showSaveFile = false
 
     private let receiver = RDReceiver()
@@ -144,22 +145,31 @@ final class Engine: ObservableObject {
         txActive = false; paused = false; progress = ""
     }
 
+    /// 可选出口：把最近收到的文件另存到别处（如 iCloud 云盘）。
+    /// 默认接收已全自动存入「下载」，这里只作为额外的主动导出入口。
+    func exportLastReceived() {
+        guard lastReceivedFile != nil else { return }
+        showSaveFile = true
+    }
+
     func start() {
         if didStart { return }; didStart = true
         receiver.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
-        receiver.onSaved = { [weak self] from, name in self?.addEntry("\(from) → 本机  \(name)", Engine.cIn) }
+        // ★ 收到文件已经自动落盘到「下载」（无需手动确认），这里只更新界面记录
+        receiver.onSaved = { [weak self] from, name, path in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.lastReceivedFile = URL(fileURLWithPath: path)
+                self.lastReceivedName = name
+                self.addEntry("\(from) → 本机  \(name)（已存「下载」）", Engine.cIn)
+            }
+        }
         receiver.onText = { [weak self] from, text in
             DispatchQueue.main.async {
                 self?.receivedFrom = from.isEmpty ? "对方" : from
                 self?.receivedText = text
                 self?.showRecvText = true
                 self?.addEntry("\(from) → 本机  [文本] \(text.count) 字", Engine.cIn)
-            }
-        }
-        receiver.onFileToSave = { [weak self] from, url, name, mime in
-            DispatchQueue.main.async {
-                self?.saveFileURL = url; self?.saveFileName = name; self?.showSaveFile = true
-                self?.addEntry("\(from) → 本机  \(name)（待存储到文件）", Engine.cIn)
             }
         }
         receiver.onStart = { [weak self] peer, total in self?.beginTx(up: false, peer: peer, total: total) }
@@ -178,6 +188,7 @@ final class Engine: ObservableObject {
         sender.onStart = { [weak self] peer, total in self?.beginTx(up: true, peer: peer, total: total) }
         sender.onProgress = { [weak self] cur, total, done, size, bps in self?.updateTx(cur: cur, total: total, done: done, size: size, bps: bps) }
         sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
+        addLog("接收到的文件会自动存入「下载」文件夹（文件 App → 我的 iPhone → RayDrop锐传 → 下载），无需手动确认；图片/视频另存一份到相册。")
         receiver.start(); discovery.start()
         // ★ 1s 一轮巡检：通道断开（LAN 4s / TS 6s）与整机离线都能在 1s 内反映到界面
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.cull() }
@@ -502,7 +513,16 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button(action: openFiles) { Label("打开文件浏览器", systemImage: "folder") }
+                    Menu {
+                        Button { openFiles() } label: { Label("打开「下载」文件夹", systemImage: "folder") }
+                        Button { engine.exportLastReceived() } label: {
+                            Label(engine.lastReceivedName.isEmpty ? "另存最近接收的文件…" : "另存「\(engine.lastReceivedName)」…",
+                                  systemImage: "square.and.arrow.up")
+                        }
+                        .disabled(engine.lastReceivedFile == nil)
+                    } label: {
+                        Label("下载", systemImage: "folder")
+                    }
                 }
             }
         }
@@ -522,7 +542,7 @@ struct ContentView: View {
             Button("关闭", role: .cancel) {}
         } message: { Text(engine.receivedText) }
         .sheet(isPresented: $engine.showSaveFile) {
-            if let u = engine.saveFileURL { DocExportPicker(url: u) }
+            if let u = engine.lastReceivedFile { DocExportPicker(url: u) }
         }
         // 改名只用 sheet：iOS 15 的 .alert 无法承载 TextField（会只弹按钮没有输入框），
         // 且同一个 Bool 同时驱动 alert 与 sheet 时 alert 会抢先弹出把 sheet 挡住。

@@ -12,12 +12,54 @@ extension RD {
         return tail
     }
 
-    /// 生成一个带真实文件名的临时文件 URL（保留扩展名，导出到「文件」App 时名字才对）
-    static func tempURL(named name: String) -> URL {
-        let safe = (name as NSString).lastPathComponent
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("raydrop_\(UUID().uuidString)", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(safe)
+    // MARK: - ★ 接收目录「下载」：收到即自动落盘，无需任何手动确认
+    /// App 沙盒 `Documents/下载`。配合 Info.plist 的 `UIFileSharingEnabled` +
+    /// `LSSupportsOpeningDocumentsInPlace`，该目录在系统「文件」App →
+    /// 我的 iPhone → RayDrop锐传 → 下载 里直接可见，不必再手动点"存储到文件"。
+    static var downloadsDir: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("下载", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// 「下载」目录下不重名的落盘路径：同名自动追加 " (2)"、" (3)"…
+    static func downloadsURL(named name: String) -> URL {
+        let dir = downloadsDir
+        let base = sanitize(name)
+        let ns = base as NSString
+        let stem = ns.deletingPathExtension
+        let ext = ns.pathExtension
+        var candidate = dir.appendingPathComponent(base)
+        var i = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let n = ext.isEmpty ? "\(stem) (\(i))" : "\(stem) (\(i)).\(ext)"
+            candidate = dir.appendingPathComponent(n)
+            i += 1
+        }
+        return candidate
+    }
+
+    /// 文件名消毒：对端可构造带路径的文件名（如 `../../x`），必须去掉路径分隔符与开头的点，
+    /// 否则会写到「下载」目录之外（目录穿越）。
+    static func sanitize(_ name: String) -> String {
+        var s = (name as NSString).lastPathComponent
+        s = s.replacingOccurrences(of: "/", with: "_")
+        s = s.replacingOccurrences(of: "\\", with: "_")
+        s = s.replacingOccurrences(of: ":", with: "_")
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        while s.hasPrefix(".") { s.removeFirst() }
+        if s.isEmpty { s = "file" }
+        return s
+    }
+
+    /// 对端没给扩展名时按 mime 补一个，让「文件」App 能正确预览（补不出则原样返回）
+    static func ensureExt(_ name: String, mime: String) -> String {
+        if !(name as NSString).pathExtension.isEmpty { return name }
+        let e = ext(forMime: mime)
+        return e.isEmpty ? name : name + "." + e
     }
 }
 
@@ -205,16 +247,16 @@ final class RDDiscovery {
     }
 }
 
-/// TCP 接收端：握手鉴权(信任码) → 逐文件收 → 落相册 → ACK（单线程保序）
-/// 支持暂停/继续/终止；相册保存失败时把原因回给发送方（ACK 里的 err），不再假成功。
+/// TCP 接收端：握手 → 逐文件收 → **全自动落盘到「下载」文件夹** → 图片/视频再另存一份相册 → ACK（单线程保序）
+/// 收到即存，**无需任何手动确认**（不再弹"存储到文件"）。只有写「下载」失败才回 err；
+/// 相册保存失败仅提示、不中断传输——因为文件已经实实在在落在「下载」里了。
 final class RDReceiver {
     var onStatus: (String) -> Void = { _ in }
-    var onSaved: (String, String) -> Void = { _, _ in }
+    var onSaved: (String, String, String) -> Void = { _, _, _ in }       // 对端名, 文件名, 落盘路径(「下载」目录内)
     var onStart: (String, Int) -> Void = { _, _ in }                    // 对端名, 文件总数
     var onProgress: (Int, Int, Int64, Int64, Double) -> Void = { _, _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 文件总大小, 字节/秒
     var onEnd: (Bool, String) -> Void = { _, _ in }
     var onText: (String, String) -> Void = { _, _ in }                       // 收到文本消息(来自, 文本)
-    var onFileToSave: (String, URL, String, String) -> Void = { _,_,_,_ in }    // 非媒体文件(来自, 临时URL, 名, mime)→上层存"文件"App
     private var listener: NWListener?
     private var current: RDStream?
     private var aborted = false;   // 用户点「终止」→ 与意外中断区分提示
@@ -263,10 +305,11 @@ final class RDReceiver {
                 let fh = try await s.readLenJSON()
                 // 发送端为排序加的 "%03d_" 序号前缀要去掉，接收方文件名与发送端原名保持一致
                 let rawName = fh["name"] as? String ?? "file\(i)"
-                let name = RD.stripOrderPrefix(rawName)
                 let size = fh["size"] as? Int ?? 0
-                let mime = fh["mime"] as? String ?? RD.mime(for: name)
+                let mime = fh["mime"] as? String ?? RD.mime(for: rawName)
                 let kind = fh["kind"] as? String ?? "file"
+                // 文件名：去排序前缀 → 消毒（防目录穿越）→ 缺扩展名时按 mime 补上（让「文件」App 能预览）
+                let name = RD.ensureExt(RD.sanitize(RD.stripOrderPrefix(rawName)), mime: mime)
 
                 if kind == "text" {
                     // 文本消息：读 size 字节到内存，回调上层弹窗展示（不落盘）
@@ -295,24 +338,34 @@ final class RDReceiver {
                 try? handle.close()
 
                 var ack: [String: Any] = ["ack": i]
-                if isMedia {
-                    // 必须等相册保存结果再回 ACK，否则发送端会显示"发送成功"而相册里没有
+                // ★ 一律自动落盘到「下载」：先让文件真正归位（这一步不弹任何界面）
+                let dst = RD.downloadsURL(named: name)
+                var saved = false
+                do {
+                    try FileManager.default.moveItem(at: tmp, to: dst)
+                    saved = true
+                } catch {
+                    // 极端情况（跨卷等）退化为拷贝
+                    if (try? FileManager.default.copyItem(at: tmp, to: dst)) != nil {
+                        try? FileManager.default.removeItem(at: tmp)
+                        saved = true
+                    } else {
+                        saveFailed = true
+                        ack["err"] = "保存到「下载」失败：\(error.localizedDescription)"
+                        onStatus("保存失败：\(name)（\(error.localizedDescription)）")
+                    }
+                }
+                if saved && isMedia {
+                    // 图片/视频：额外存一份进系统「相册」（「下载」里那份保留，不移动不删除）。
+                    // 相册失败只提示、不中断——文件已在「下载」里，发送端显示成功是真实的。
                     let res: (Bool, String) = await withCheckedContinuation { cont in
-                        RDMediaSaver.save(tempFile: tmp, name: name, mime: mime) { ok, err in
+                        RDMediaSaver.saveExisting(file: dst, name: name, mime: mime) { ok, err in
                             cont.resume(returning: (ok, err))
                         }
                     }
-                    if res.0 { onSaved(fromName, name) }
-                    else { saveFailed = true; ack["err"] = "保存到相册失败：\(res.1)"; onStatus("保存失败：\(name)（\(res.1)）") }
-                } else {
-                    // 非媒体文件：临时文件先改成真实文件名（带扩展名），再交给上层 present 保存到"文件"App。
-                    // 否则导出时只会看到 rd_<UUID> 这种无扩展名临时名。存不存由用户决定，故不报失败。
-                    let real = RD.tempURL(named: name)
-                    try? FileManager.default.removeItem(at: real)
-                    do { try FileManager.default.moveItem(at: tmp, to: real) }
-                    catch { onStatus("临时文件改名失败：\(error.localizedDescription)") }
-                    onFileToSave(fromName, real, name, mime)
+                    if !res.0 { onStatus("已存「下载」，但写入相册失败：\(name)（\(res.1)）") }
                 }
+                if saved { onSaved(fromName, name, dst.path) }
                 RDWrite.line(s.conn, ack)   // 收完才放行下一个
             }
             _ = try? await s.readLine()   // done

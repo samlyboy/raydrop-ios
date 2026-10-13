@@ -20,6 +20,39 @@ enum RD {
         if n.hasSuffix(".mov") { return "video/quicktime" }
         return "application/octet-stream"
     }
+
+    /// mime → 扩展名（对端发来的文件没带扩展名时补一个，让「文件」App 能正确预览/打开）
+    static func ext(forMime mime: String) -> String {
+        let m = mime.lowercased()
+        if m.hasPrefix("image/") {
+            switch m {
+            case "image/png": return "png"
+            case "image/heic": return "heic"
+            case "image/webp": return "webp"
+            case "image/gif": return "gif"
+            case "image/jpeg", "image/jpg": return "jpg"
+            default: return "jpg"
+            }
+        }
+        if m.hasPrefix("video/") {
+            switch m {
+            case "video/mp4": return "mp4"
+            case "video/quicktime": return "mov"
+            case "video/x-matroska", "video/x-matertroska": return "mkv"
+            case "video/webm": return "webm"
+            default: return "mp4"
+            }
+        }
+        switch m {
+        case "application/pdf": return "pdf"
+        case "application/zip": return "zip"
+        case "application/json": return "json"
+        case "application/vnd.android.package-archive": return "apk"
+        case "text/plain": return "txt"
+        case "text/csv": return "csv"
+        default: return ""
+        }
+    }
 }
 
 /// 基于 NWConnection 的带缓冲异步流：精确读 n 字节 / 读一行 / 读 4字节长度前缀 JSON。

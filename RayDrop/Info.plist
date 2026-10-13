@@ -9,9 +9,12 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>RayDrop</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>28.0</string>
-	<key>CFBundleVersion</key><string>28</string>
+	<key>CFBundleShortVersionString</key><string>29.0</string>
+	<key>CFBundleVersion</key><string>29</string>
 	<key>LSRequiresIPhoneOS</key><true/>
+	<!-- ★ 接收文件全自动落盘到沙盒 Documents/下载，并让该目录在系统「文件」App 里直接可见（我的 iPhone → RayDrop锐传 → 下载），无需手动"存储到文件" -->
+	<key>UIFileSharingEnabled</key><true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key><true/>
 	<key>NSLocalNetworkUsageDescription</key><string>用于在同一局域网内发现 RayDrop 设备</string>
 	<key>NSPhotoLibraryAddUsageDescription</key><string>用于把接收到的图片/视频保存到你的相册</string>
 	<key>UILaunchScreen</key><dict/>
