@@ -34,8 +34,15 @@ final class Tailscale {
         return tok
     }
 
-    /// 拉取 tailnet 设备，返回非本机的 100.x 地址列表。
+    /// 拉取 tailnet 设备，返回非本机的 100.x 地址列表（探测目标）。
     func peerTSAddresses() -> [String] {
+        peerTSDevices().map { $0.ip }
+    }
+
+    /// ★ 两层模型 · 第一层「花名册」：tailnet 内全部已知设备（名字 + 100.x），
+    /// 无论对方 RayDrop 是否在线都返回，供 UI 常显（离线设备灰显）。
+    struct TSDevice { let name: String; let ip: String }
+    func peerTSDevices() -> [TSDevice] {
         do {
             let tok = try token()
             var req = URLRequest(url: URL(string: "https://api.tailscale.com/api/v2/tailnet/-/devices")!)
@@ -50,11 +57,12 @@ final class Tailscale {
                 return []
             }
             let selfIPs = Set(RDIP.ips())
-            var out: [String] = []
+            var out: [TSDevice] = []
             for d in devs {
+                let name = (d["name"] as? String) ?? "设备"
                 guard let addrs = d["addresses"] as? [String] else { continue }
                 for ip in addrs where ip.hasPrefix("100.") {
-                    if !selfIPs.contains(ip) { out.append(ip) }
+                    if !selfIPs.contains(ip) { out.append(TSDevice(name: name, ip: ip)) }
                 }
             }
             return out

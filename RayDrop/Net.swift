@@ -138,8 +138,8 @@ final class RDDiscovery {
     private func broadcastLoop() {
         while running {
             send(to: "255.255.255.255")              // 局域网广播（可能被系统拦下，失败也无所谓）
-            for ip in targets() { send(to: ip) }     // 单播兜底
-            Thread.sleep(forTimeInterval: 3)
+            for ip in targets() { send(to: ip) }     // 单播兜底（含跨 Tailscale 的 100.x 探测）
+            Thread.sleep(forTimeInterval: 2)         // ★ 2s 一轮探测：LAN 通道 4s / TS 通道 6s 无应答即该通道单独消失
         }
     }
 
@@ -154,7 +154,7 @@ final class RDDiscovery {
                 for h in 1...254 { targets.append("\(parts[0]).\(parts[1]).\(parts[2]).\(h)") }
             }
             for ip in targets { send(to: ip) }
-            Thread.sleep(forTimeInterval: 5)      // ★ 5 秒一轮，保证在线设备实时更新
+            Thread.sleep(forTimeInterval: 5)      // ★ 5 秒一轮，保证在线设备实时更新（仅本网段兜底）
         }
     }
 

@@ -30,6 +30,10 @@ final class Engine: ObservableObject {
         var tsHost: String
         var port: UInt16
         var lastSeen: Date
+        /// ★ 两条通道各自「最近一次真从该通道收到报文」的时刻。
+        ///   某条线路断开（对方关 Tailscale / 离开局域网）→ 该通道在各自窗口超时后单独消失，不拖累另一条。
+        var lanSeen: Date = .distantPast
+        var tsSeen: Date = .distantPast
         /// 手机 vs 电脑图标
         var isComputer: Bool {
             let p = platform.lowercased()
@@ -43,6 +47,10 @@ final class Engine: ObservableObject {
     @Published var myCode = RDStore.shared.myCode
     @Published var myName = RDStore.shared.myName
     @Published var devices: [DeviceInfo] = []
+    /// ★ 通道存活窗口：LAN 4s（公告/探测周期 2s，容 2 次丢包）/ TS 6s（跨洲 DERP 单包易丢，容 3 次）。
+    ///   列表只显示窗口内「真从该通道收到过报文」的设备；某条线路断开 → 该通道单独消失。
+    static let lanTtl: TimeInterval = 4
+    static let tsTtl: TimeInterval = 6
     @Published var progress = ""
     @Published var txActive = false
     @Published var paused = false
@@ -171,7 +179,8 @@ final class Engine: ObservableObject {
         sender.onProgress = { [weak self] cur, total, done, size, bps in self?.updateTx(cur: cur, total: total, done: done, size: size, bps: bps) }
         sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         receiver.start(); discovery.start()
-        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.cull() }
+        // ★ 1s 一轮巡检：通道断开（LAN 4s / TS 6s）与整机离线都能在 1s 内反映到界面
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.cull() }
         // 跨 Tailscale 发现（手机↔手机纯 TS）：周期拉 tailnet 设备 100.x → 单播探测目标
         refreshTailscale()
         // ★ 启动连刷两次（2s/5s 后），抵消一次网络抖动导致 tsTargets 空、靠 15s 才补齐的延迟
@@ -188,30 +197,22 @@ final class Engine: ObservableObject {
         let port = UInt16((o["port"] as? NSNumber)?.intValue ?? Int(RD.tcpPort))
 
         let myIPs = RDIP.ips()
-        let myHasTS = myIPs.contains { $0.hasPrefix("100.") }
         let src = o["srcIP"] as? String ?? ""
 
         // ★ 关键判据（锐哥修正）：LAN 地址只有「包从真实局域网到达」(src 非 100.x 且与本机同 /24) 才可信。
         //   从 Tailscale 包里对端自报的局域网地址(其自己另一物理网络的 192.168.1.x)即使恰巧同 /24，
-        //   也只是"假同局域网"——物理不互通、连不通，必须丢弃，只保留 Tailscale。
-        //   真同局域网的设备会同时收到它的 LAN 包 + TS 包，于是 LAN 与 TS 两条都保留（正是要的效果）。
+        //   也只是"假同局域网"——物理不互通、连不通，必须丢弃。
         let viaLan = !src.isEmpty && !src.hasPrefix("100.") && Engine.sameSubnet(src, myIPs)
+        let viaTs  = src.hasPrefix("100.")
 
-        // TS 地址：仅取载荷 ips 里的 100.x（本机有 TS 才能用）
+        // 对方载荷里自报的 100.x（仅用于判断「它还有没有 Tailscale」，不作为通道可用依据）
         var peerTS = ""
         for ip in ips where ip.hasPrefix("100.") { peerTS = ip; break }
-        if src.hasPrefix("100.") { peerTS = src }   // 从 TS 到达，源即 TS 地址
-
-        // LAN 地址：仅当包从真实局域网到达，源地址即真同网段邻居
-        let peerLan = viaLan ? src : ""
-
-        var lan = peerLan
-        var ts = (myHasTS && !peerTS.isEmpty) ? peerTS : ""
-        // 兜底：两个都空时仍保留快照，保证可见
-        if lan.isEmpty && ts.isEmpty { lan = peerLan; ts = peerTS }
+        if viaTs { peerTS = src }
 
         let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
-        upsert(id: did, code: code, name: name, platform: platform, lanHost: lan, tsHost: ts, port: port)
+        upsert(id: did, code: code, name: name, platform: platform,
+               src: src, viaLan: viaLan, viaTs: viaTs, peerTSAdvertised: peerTS, port: port)
         discovery.announceTo(src.isEmpty ? [] : [src])   // 回告报文来源，对方立刻能看到我
         syncTargets()
     }
@@ -226,20 +227,45 @@ final class Engine: ObservableObject {
         }
         return false
     }
-    private func upsert(id: String, code: String, name: String, platform: String, lanHost: String, tsHost: String, port: UInt16) {
+    /// ★ 通道级存活（本轮核心修复）：只有「真从该通道收到报文」才刷新对应通道的时刻。
+    ///   - 局域网通道：包从同网段到达（src 非 100.x 且同 /24）→ 刷新 lanSeen；
+    ///   - Tailscale 通道：包真从 100.x 到达 → 刷新 tsSeen（不再只凭对方载荷里写了个 100.x 就当可用，
+    ///     那样对方关了 Tailscale 仍会显示一条连不通的 Tailscale 记录）；
+    ///   - 即时判「对方已关 Tailscale」：LAN 包到达、对方载荷不再带任何 100.x、且近 3s 无 TS 报文
+    ///     → 立刻清空 TS 通道（≤2s 内该行消失，只留【局域网】）。
+    private func upsert(id: String, code: String, name: String, platform: String,
+                        src: String, viaLan: Bool, viaTs: Bool, peerTSAdvertised: String, port: UInt16) {
         var idx = devices.firstIndex { $0.id == id }
         if idx == nil { idx = devices.firstIndex { $0.code == code } }
-        if idx == nil, !lanHost.isEmpty { idx = devices.firstIndex { $0.name == name && $0.lanHost == lanHost } }
+        if idx == nil, viaLan { idx = devices.firstIndex { $0.name == name && $0.lanHost == src } }
+        let now = Date()
         if let i = idx {
             devices[i].id = id.hasPrefix("cf:") ? devices[i].id : id
             devices[i].code = code; devices[i].name = name; devices[i].platform = platform
-            // ★ 只覆盖非空地址：TS 包到达时 lanHost 为空，不能把刚收到的真 LAN 地址清掉
-            if !lanHost.isEmpty { devices[i].lanHost = lanHost }
-            if !tsHost.isEmpty { devices[i].tsHost = tsHost }
-            devices[i].port = port; devices[i].lastSeen = Date()
+            devices[i].port = port; devices[i].lastSeen = now
+            if viaLan { devices[i].lanHost = src; devices[i].lanSeen = now }
+            if viaTs  { devices[i].tsHost  = src; devices[i].tsSeen  = now }
+            if viaLan && !viaTs && peerTSAdvertised.isEmpty && now.timeIntervalSince(devices[i].tsSeen) > 3 {
+                devices[i].tsHost = ""; devices[i].tsSeen = .distantPast
+            }
         } else {
-            devices.append(DeviceInfo(id: id, code: code, name: name, platform: platform, lanHost: lanHost, tsHost: tsHost, port: port, lastSeen: Date()))
+            // 两条通道都没被证实（来源既非同网段也非 100.x）→ 不做一条连不通的记录，直接丢弃
+            if !viaLan && !viaTs { return }
+            var d = DeviceInfo(id: id, code: code, name: name, platform: platform,
+                               lanHost: "", tsHost: "", port: port, lastSeen: now)
+            if viaLan { d.lanHost = src; d.lanSeen = now }
+            if viaTs  { d.tsHost  = src; d.tsSeen  = now }
+            devices.append(d)
         }
+    }
+
+    /// 局域网通道是否在线（lanTtl 内真从局域网收到过报文）
+    func lanAlive(_ d: DeviceInfo) -> Bool {
+        !d.lanHost.isEmpty && Date().timeIntervalSince(d.lanSeen) <= Engine.lanTtl
+    }
+    /// Tailscale 通道是否在线（tsTtl 内真从 100.x 收到过报文）
+    func tsAlive(_ d: DeviceInfo) -> Bool {
+        !d.tsHost.isEmpty && Date().timeIntervalSince(d.tsSeen) <= Engine.tsTtl
     }
     private func syncTargets() {
         var all: [String] = []
@@ -248,11 +274,14 @@ final class Engine: ObservableObject {
         discovery.setExtraTargets(all)
     }
 
-    /// 用内嵌 OAuth client 拉取 tailnet 在线设备的 100.x 地址，刷新单播探测目标
+    /// 用内嵌 OAuth client 拉取 tailnet 设备的 100.x，仅刷新「单播探测目标」。
+    /// （已移除「花名册」显示层：tailnet 里没开 RayDrop 的设备不进列表，列表只显示真收到报文的在线设备。）
     private func refreshTailscale() {
         DispatchQueue.global().async {
-            let addrs = Tailscale.shared.peerTSAddresses()
+            let devs = Tailscale.shared.peerTSDevices()
+            guard !devs.isEmpty else { return }   // API 失败/空：保活现有 targets，下次周期重试
             DispatchQueue.main.async {
+                let addrs = devs.map { $0.ip }
                 let old = Set(self.tsTargets)
                 self.tsTargets = addrs
                 self.syncTargets()
@@ -271,12 +300,24 @@ final class Engine: ObservableObject {
             }
         }
     }
+    /// 定期巡检（1s 一轮，及时反映上下线）：
+    ///  ① 通道级过期：某条线路断开 → 立刻清空该通道，让它在列表里单独消失（不影响另一条）；
+    ///  ② 两条通道都断了 → 整台设备从列表移除。
+    ///  旧实现 5s 轮询 + 12s 整机 TTL → 最多 17s 才消失，现降到「LAN 4s / TS 6s + 1s 轮询」。
     private func cull() {
         let now = Date()
-        // ★ 12 秒没收到对方报文即判离线（对方广播周期 3~5s，12s 容得下丢包）。
-        //   原来 45s 会让「APP 一关，其它端还挂着显示在线」将近一分钟。
-        let kept = devices.filter { now.timeIntervalSince($0.lastSeen) < 12 }
-        if kept.count != devices.count { devices = kept; syncTargets() }
+        var changed = false
+        for i in devices.indices {
+            if !devices[i].lanHost.isEmpty && now.timeIntervalSince(devices[i].lanSeen) > Engine.lanTtl {
+                devices[i].lanHost = ""; devices[i].lanSeen = .distantPast; changed = true
+            }
+            if !devices[i].tsHost.isEmpty && now.timeIntervalSince(devices[i].tsSeen) > Engine.tsTtl {
+                devices[i].tsHost = ""; devices[i].tsSeen = .distantPast; changed = true
+            }
+        }
+        let kept = devices.filter { !$0.lanHost.isEmpty || !$0.tsHost.isEmpty }
+        if kept.count != devices.count { devices = kept; changed = true }
+        if changed { syncTargets() }
     }
 
     func setCode(_ c: String) {
@@ -542,11 +583,13 @@ struct ContentView: View {
     private var deviceList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 2) {
-                if engine.devices.isEmpty {
+                // ★ 列表只显示「真从对应通道收到过报文」的设备（各自窗口内）；两条都断就整台消失。
+                //   已移除「Tailscale · 离线」灰显组：离线设备不再进列表。
+                let lan = engine.devices.filter { engine.lanAlive($0) }
+                let ts = engine.devices.filter { engine.tsAlive($0) }
+                if lan.isEmpty && ts.isEmpty {
                     Text("未发现设备，等待广播/探测…").foregroundColor(.gray).font(.footnote).padding(.horizontal)
                 } else {
-                    let lan = engine.devices.filter { !$0.lanHost.isEmpty }
-                    let ts = engine.devices.filter { !$0.tsHost.isEmpty }
                     if !lan.isEmpty {
                         Text("【局域网】").font(.caption2).foregroundColor(.secondary).padding(.horizontal)
                         ForEach(lan) { devRow($0, $0.lanHost) }
@@ -710,8 +753,8 @@ struct ShareInboxSheet: View {
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 2) {
-                            ForEach(engine.devices.filter { !$0.lanHost.isEmpty }) { d in devBtn(d, d.lanHost) }
-                            ForEach(engine.devices.filter { !$0.tsHost.isEmpty }) { d in devBtn(d, d.tsHost) }
+                            ForEach(engine.devices.filter { engine.lanAlive($0) }) { d in devBtn(d, d.lanHost) }
+                            ForEach(engine.devices.filter { engine.tsAlive($0) }) { d in devBtn(d, d.tsHost) }
                         }
                         .padding(.horizontal).padding(.vertical, 6)
                     }
