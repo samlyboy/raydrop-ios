@@ -6,6 +6,3 @@ app_extract/
 *.ipa
 *.xcarchive/
 *.xcodeproj/
-
-# ⚠️ 含 Tailscale 只读凭据，绝不入库（CI 通过 GitHub Secrets 注入同名文件）
-RayDrop/Config.swift
