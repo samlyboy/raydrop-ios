@@ -253,8 +253,21 @@ final class Engine: ObservableObject {
         DispatchQueue.global().async {
             let addrs = Tailscale.shared.peerTSAddresses()
             DispatchQueue.main.async {
+                let old = Set(self.tsTargets)
                 self.tsTargets = addrs
                 self.syncTargets()
+                // ★ 新出现的 tailnet 设备：快速连发告知，克服跨洲 DERP 丢包、加速互相发现
+                let fresh = addrs.filter { !old.contains($0) }
+                if !fresh.isEmpty { self.burstAnnounce(fresh) }
+            }
+        }
+    }
+    /// 新出现的 tailnet 设备：6 次 × 0.3s 连发告知，让刚上线的对端数秒内必定收到本机公告
+    private func burstAnnounce(_ ips: [String]) {
+        DispatchQueue.global().async {
+            for _ in 0..<6 {
+                self.discovery.announceTo(ips)
+                Thread.sleep(forTimeInterval: 0.3)
             }
         }
     }
