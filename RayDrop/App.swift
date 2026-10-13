@@ -174,7 +174,10 @@ final class Engine: ObservableObject {
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.cull() }
         // 跨 Tailscale 发现（手机↔手机纯 TS）：周期拉 tailnet 设备 100.x → 单播探测目标
         refreshTailscale()
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshTailscale() }
+        // ★ 启动连刷两次（2s/5s 后），抵消一次网络抖动导致 tsTargets 空、靠 15s 才补齐的延迟
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in self?.refreshTailscale() }
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in self?.refreshTailscale() }
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.refreshTailscale() }
     }
 
     private func ingest(_ o: [String: Any]) {
