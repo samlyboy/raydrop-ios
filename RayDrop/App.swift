@@ -460,9 +460,9 @@ final class Engine: ObservableObject {
                 let ext = (real as NSString).pathExtension.lowercased()
                 let isImg = ["jpg","jpeg","png","heic","webp","gif","bmp"].contains(ext)
                 let isVid = ["mp4","mov","mkv","avi"].contains(ext)
-                // 移到临时目录（App Group 容器文件不能长期引用），同时从 inbox 移除
-                let tmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(UUID().uuidString + "-" + real)
+                // 移到临时目录（App Group 容器文件不能长期引用），同时从 inbox 移除。
+                // ★ 放进独立 UUID 子目录、保留原名——绝不能在文件名前拼 UUID（那串会跟着发给对端）
+                let tmp = tempSlot(for: real)
                 try? FileManager.default.removeItem(at: tmp)
                 do {
                     try FileManager.default.moveItem(at: f, to: tmp)   // move 而非 copy：inbox 里的原件随之消失
@@ -509,16 +509,28 @@ final class Engine: ObservableObject {
         }
     }
 
-    /// 清理本轮分享复制到临时目录的文件，避免长期占用空间
+    /// 清理本轮分享复制到临时目录的内容（连同各自的 rdshare_ 子目录），避免长期占用空间。
+    /// ★ 只删自己建的 rdshare_ 前缀目录，别误删保活音频 rd_keepalive.wav。
     func clearPendingTempFiles() {
         let tmp = FileManager.default.temporaryDirectory
         guard let fs = try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil) else { return }
-        for f in fs where f.lastPathComponent.contains("-") && f.lastPathComponent.count > 36 {
+        for f in fs where f.lastPathComponent.hasPrefix("rdshare_") {
             try? FileManager.default.removeItem(at: f)
         }
     }
+
+    /// ★ 把外部文件放进临时目录的「独占槽位」，**保持原文件名**。
+    ///   历史 bug：以前是 `UUID()-原名`，发送时直接用 `lastPathComponent`，于是对端收到的文件名
+    ///   变成 `D17486E5-…-raydrop-v32`。改为放进独立 UUID 子目录，末段仍是原名，且不同项互不撞名。
+    private func tempSlot(for name: String) -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rdshare_" + UUID().uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(name)
+    }
+
     private func copyTemp(_ src: URL) -> URL {
-        let dst = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + src.lastPathComponent)
+        let dst = tempSlot(for: src.lastPathComponent)
         try? FileManager.default.copyItem(at: src, to: dst)
         return dst
     }

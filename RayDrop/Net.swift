@@ -12,6 +12,21 @@ extension RD {
         return tail
     }
 
+    /// 去掉旧版 iOS 发送端在临时文件名前拼的 UUID 前缀
+    /// （"D17486E5-ED0D-45CB-8CFB-818ECD6C2A3F-raydrop-v32.ipa" → "raydrop-v32.ipa"）。
+    /// 严格要求「36 位标准 UUID + '-'」且去掉后仍有扩展名，正常文件名不会被误伤。
+    static func stripUUIDPrefix(_ name: String) -> String {
+        guard name.count > 37 else { return name }
+        let idx = name.index(name.startIndex, offsetBy: 36)
+        guard name[idx] == "-" else { return name }
+        let parts = String(name[..<idx]).split(separator: "-").map(String.init)
+        guard parts.count == 5, parts.map({ $0.count }) == [8, 4, 4, 4, 12],
+              parts.allSatisfy({ $0.allSatisfy { $0.isHexDigit } }) else { return name }
+        let tail = String(name[name.index(after: idx)...])
+        if (tail as NSString).pathExtension.isEmpty { return name }
+        return tail
+    }
+
     // MARK: - ★ 接收目录「下载」：收到即自动落盘，无需任何手动确认
     /// App 沙盒 `Documents/下载`。配合 Info.plist 的 `UIFileSharingEnabled` +
     /// `LSSupportsOpeningDocumentsInPlace`，该目录在系统「文件」App →
@@ -355,7 +370,7 @@ final class RDReceiver {
                 let mime = fh["mime"] as? String ?? RD.mime(for: rawName)
                 let kind = fh["kind"] as? String ?? "file"
                 // 文件名：去排序前缀 → 消毒（防目录穿越）→ 缺扩展名时按 mime 补上（让「文件」App 能预览）
-                let name = RD.ensureExt(RD.sanitize(RD.stripOrderPrefix(rawName)), mime: mime)
+                let name = RD.ensureExt(RD.sanitize(RD.stripUUIDPrefix(RD.stripOrderPrefix(rawName))), mime: mime)
 
                 if kind == "text" {
                     // 文本消息：读 size 字节到内存，回调上层弹窗展示（不落盘）
