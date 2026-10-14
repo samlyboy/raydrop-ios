@@ -161,6 +161,13 @@ final class RDDiscovery {
     /// 单播告知指定 IP（广播通道不通时的兜底）
     func announceTo(_ ips: [String]) { for ip in ips { send(to: ip) } }
 
+    /// ★ 立刻对全部已知目标发一轮公告（广播 + 已发现 + tailnet 目标）。
+    ///   用于「接收服务重建后」和「回到前台」时，让对端马上刷新本机在线状态。
+    func announceAll() {
+        send(to: "255.255.255.255")
+        for ip in targets() { send(to: ip) }
+    }
+
     private func send(to ip: String) {
         guard sendSock >= 0, let data = announcement() else { return }
         var addr = sockaddr_in()
@@ -260,9 +267,25 @@ final class RDReceiver {
     private var listener: NWListener?
     private var current: RDStream?
     private var aborted = false;   // 用户点「终止」→ 与意外中断区分提示
+    /// ★ 监听是否处于 ready。iOS 把 App 压到后台/被系统抢占时，NWListener 会掉到 waiting/failed，
+    ///   套接字随之失效 → 对端 TCP 连接直接被拒（ECONNREFUSED）。而 UDP 发现（裸 socket + 音频保活）
+    ///   仍在工作 → 表现为「列表里显示在线，却怎么都发不进来」。安卓/电脑端用的是常驻
+    ///   ServerSocket / TcpListener，不会有这个现象——这正是「只有苹果端收不到」的根因。
+    private(set) var isListening = false
+    /// 监听就绪（含重建成功）后回调：让上层立刻重新公告，对端随即刷新本机在线状态
+    var onListening: () -> Void = { }
 
     func start() {
         aborted = false
+        beginListening()
+    }
+
+    /// 建立（或重建）监听。可重复调用：先废弃旧监听再新建，避免端口占用。
+    private func beginListening() {
+        listener?.stateUpdateHandler = nil
+        listener?.cancel()
+        listener = nil
+        isListening = false
         do {
             let l = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: RD.tcpPort)!)
             l.newConnectionHandler = { (conn: NWConnection) in
@@ -271,12 +294,35 @@ final class RDReceiver {
                 self.current = stream
                 Task { await self.handle(stream) }
             }
+            l.stateUpdateHandler = { [weak self] st in
+                guard let self else { return }
+                switch st {
+                case .ready:
+                    self.isListening = true
+                    self.onStatus("接收服务已开启")
+                    self.onListening()
+                case .failed, .cancelled, .waiting:
+                    self.isListening = false
+                default:
+                    break
+                }
+            }
             l.start(queue: DispatchQueue.global())
             listener = l
-            onStatus("接收服务已开启")
         } catch {
             onStatus("接收端口错误: \(error.localizedDescription)")
         }
+    }
+
+    /// ★ 巡检自愈：不在 ready 就重建监听（NWListener 掉到 waiting/failed 后不会自行恢复）。
+    ///   返回 true 表示本次确实重建了一次。
+    @discardableResult
+    func ensureListening() -> Bool {
+        if isListening { return false }
+        // 刚启动、尚未 ready：给一点宽限，避免把正在建立的监听反复推倒重建
+        if let l = listener, case .setup = l.state { return false }
+        beginListening()
+        return true
     }
 
     func pause() { current?.setPaused(true) }

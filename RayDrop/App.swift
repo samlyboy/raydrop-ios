@@ -156,6 +156,8 @@ final class Engine: ObservableObject {
     func start() {
         if didStart { return }; didStart = true
         receiver.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
+        // ★ 监听就绪（含被系统挂起后的自动重建）→ 立刻公告一轮，让对端马上刷新本机在线状态
+        receiver.onListening = { [weak self] in self?.onReceiverReady() }
         // ★ 收到文件已经自动落盘到「下载」（无需手动确认），这里只更新界面记录
         receiver.onSaved = { [weak self] from, name, path in
             DispatchQueue.main.async {
@@ -191,8 +193,15 @@ final class Engine: ObservableObject {
         sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
         addLog("接收到的文件会自动存入「下载」文件夹（文件 App → 我的 iPhone → RayDrop锐传 → 下载），无需手动确认；图片/视频另存一份到相册。")
         receiver.start(); discovery.start()
-        // ★ 1s 一轮巡检：通道断开（LAN 4s / TS 6s）与整机离线都能在 1s 内反映到界面
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.cull() }
+        // ★ 1s 一轮巡检：通道断开（LAN 10s / TS 20s）与整机离线都能在 1s 内反映到界面；
+        //   同时每 5s 做一次「接收监听健康检查」——NWListener 被系统压成 waiting/failed 后不会自愈，
+        //   不重建就会「对端显示本机在线，却一发就 ECONNREFUSED」。
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.cull()
+            self.healthTick += 1
+            if self.healthTick % 5 == 0 { self.ensureReceiverUp() }
+        }
         // 跨 Tailscale 发现（手机↔手机纯 TS）：周期拉 tailnet 设备 100.x → 单播探测目标
         refreshTailscale()
         // ★ 启动连刷两次（2s/5s 后），抵消一次网络抖动导致 tsTargets 空、靠 15s 才补齐的延迟
@@ -312,6 +321,36 @@ final class Engine: ObservableObject {
             }
         }
     }
+    // MARK: - 接收服务自愈（治「列表显示在线但发不进来」）
+    /// App 是否在前台。后台不重建监听——重建也会立刻被系统压回 waiting，且白耗电。
+    var appActive = true
+    /// 1s 巡检计数器：每 5 次（≈5s）做一次监听健康检查
+    private var healthTick = 0
+
+    /// ★ 监听不在 ready 就重建，并立刻重新公告。
+    ///   根因：iOS 把 App 压到后台/被抢占时 NWListener 会掉到 waiting/failed，套接字失效 →
+    ///   对端 TCP 连接被 RST（ECONNREFUSED），而 UDP 心跳仍在 → 「显示在线却发不进来」。
+    func ensureReceiverUp() {
+        guard appActive else { return }
+        if receiver.ensureListening() {
+            addLog("接收服务已自动重建（此前被系统挂起导致监听失效）")
+            discovery.announceAll()
+        }
+    }
+
+    /// 回到前台时调用：确认监听可用 + 立刻公告一轮 + 重查 tailnet 目标
+    func onForeground() {
+        appActive = true
+        _ = receiver.ensureListening()
+        discovery.announceAll()
+        refreshTailscale()
+    }
+
+    /// 监听就绪（含重建）→ 立刻公告，让对端第一时间刷新本机在线状态
+    private func onReceiverReady() {
+        discovery.announceAll()
+    }
+
     /// 定期巡检（1s 一轮，及时反映上下线）：
     ///  ① 通道级过期：某条线路断开 → 立刻清空该通道，让它在列表里单独消失（不影响另一条）；
     ///  ② 两条通道都断了 → 整台设备从列表移除。
@@ -495,6 +534,7 @@ struct ContentView: View {
     @State var editName = false
     @State var editNameDraft = ""
     @State var showShareInbox = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationView {
@@ -514,8 +554,17 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    // ★ 单击直达：一下点开系统「文件」App（不再折叠成菜单，少一次点击）
-                    Button(action: openFiles) { Label("打开文件浏览器", systemImage: "folder") }
+                    // ★ 单击直达：一下点开系统「文件」App（不再折叠成菜单，少一次点击）。
+                    //   必须显式给足点按区域（frame + contentShape）：新版 iOS 把工具栏按钮的可点区域
+                    //   缩到图标字形本身，导致「看着在那儿、却要找准点才能点开」——这里撑成 44×44。
+                    Button(action: openFiles) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 17, weight: .semibold))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("打开文件浏览器")
                 }
             }
         }
@@ -547,7 +596,12 @@ struct ContentView: View {
         }
         .sheet(isPresented: $engine.showSharePrompt) { ShareInboxSheet(engine: engine) }
         .onReceive(NotificationCenter.default.publisher(for: .rdAppShouldScanInbox)) { _ in engine.consumeSharedItems() }
-        .onAppear { engine.start(); engine.consumeSharedItems() }
+        .onAppear { engine.appActive = (scenePhase == .active); engine.start(); engine.consumeSharedItems() }
+        .onChange(of: scenePhase) { phase in
+            // ★ 回到前台：确认接收监听可用 + 立刻公告一轮，修正「对端显示在线却发不进来」
+            engine.appActive = (phase == .active)
+            if phase == .active { engine.onForeground() }
+        }
     }
 
     /// 只保留设备名称：前缀加粗大字体，点一下直接编辑（不再显示 3 位码与铅笔图标）
