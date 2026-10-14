@@ -14,7 +14,15 @@ final class RDKeepAlive: NSObject, AVAudioPlayerDelegate
     private var session: AVAudioSession?
     private var timer: Timer?
 
-    @objc private func handleInterruption(_ note: Notification) { /* 中断后尝试恢复 */ }
+    /// 音频中断（来电 / 其它 App 抢占）结束后恢复播放：否则保活静默失效、后台服务被挂起、对端误判离线。
+    @objc private func handleInterruption(_ note: Notification) {
+        guard let info = note.userInfo,
+              let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        guard type == .ended else { return }
+        try? AVAudioSession.sharedInstance().setActive(true, options: [])
+        player?.play()
+    }
 
     /// 启动保活（可在 App 启动时调用一次）
     func start()
@@ -40,9 +48,11 @@ final class RDKeepAlive: NSObject, AVAudioPlayerDelegate
             self.player = p
         }
 
-        // 兜底：定期把会话重新激活，防止长时间后台被系统挂起
-        let t = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-            guard let self, self.player?.isPlaying == true else { return }
+        // 兜底（双保险）：定期检查——会话被系统回收就重新激活，播放器被中断就重新开播。
+        // 只"重新激活会话"不够：中断后 player 会停，必须重开播，否则后台保活失效 → 对端误判离线。
+        let t = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if self.player?.isPlaying != true { self.player?.play() }
             try? AVAudioSession.sharedInstance().setActive(true, options: [])
         }
         RunLoop.main.add(t, forMode: .common)
@@ -79,7 +89,15 @@ final class RDKeepAlive: NSObject, AVAudioPlayerDelegate
         appendTag("fmt "); append32(16); append16(1); append16(1)
         append32(sampleRate); append32(byteRate); append16(blockAlign); append16(16)
         appendTag("data"); append32(UInt32(dataSize))
-        data.append(Data(count: dataSize))            // 全 0 = 静音
+        // ★ 不能用「全 0 数字静音」：部分 iOS 版本会把纯静音视作无效播放而挂起 App，
+        //   后台 UDP 发现随之停摆 → 对端把本机误判为离线（而 Tailscale 由独立扩展进程持有，仍显示在线）。
+        //   改用 200Hz 正弦、幅度 ±8 LSB（≈-72dBFS，再叠加 player 音量后完全听不见），出声数据非零 → 保活更稳。
+        var pcm = Data(capacity: dataSize)
+        for i in 0..<Int(samples) {
+            let v = Int16(round(8.0 * sin(2.0 * Double.pi * 200.0 * Double(i) / Double(sampleRate))))
+            withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) }
+        }
+        data.append(pcm)
 
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("rd_keepalive.wav")
         do { try data.write(to: url); return url } catch { return nil }

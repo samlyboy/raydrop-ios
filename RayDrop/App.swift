@@ -47,10 +47,11 @@ final class Engine: ObservableObject {
     @Published var myCode = RDStore.shared.myCode
     @Published var myName = RDStore.shared.myName
     @Published var devices: [DeviceInfo] = []
-    /// ★ 通道存活窗口：LAN 4s（公告/探测周期 2s，容 2 次丢包）/ TS 6s（跨洲 DERP 单包易丢，容 3 次）。
-    ///   列表只显示窗口内「真从该通道收到过报文」的设备；某条线路断开 → 该通道单独消失。
-    static let lanTtl: TimeInterval = 4
-    static let tsTtl: TimeInterval = 6
+    /// ★ 通道存活窗口：公告/探测周期 2s。窗口需容忍链路抖动与丢包，否则一两次丢包就误判离线、列表反复上下线。
+    ///   LAN 10s（容 4 次丢包）/ TS 20s（跨洲 DERP + iOS 后台抖动，容 9 次丢包）。
+    ///   正常退出走 bye 即时移除，不受此窗口影响；窗口只兜底「异常掉线」。
+    static let lanTtl: TimeInterval = 10
+    static let tsTtl: TimeInterval = 20
     @Published var progress = ""
     @Published var txActive = false
     @Published var paused = false
