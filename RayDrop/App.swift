@@ -56,6 +56,12 @@ final class Engine: ObservableObject {
     @Published var progress = ""
     @Published var txActive = false
     @Published var paused = false
+    /// ★ v41：正在发送（**含「连接中」阶段**）的目标设备 id。
+    ///   旧实现只有 TCP 连上并握手成功后才进 txActive，连接那几秒到十几秒界面毫无变化，
+    ///   用户以为没点中就连点几下 —— 每一下都新起一条连接。现在点下去立刻转圈并锁住该行。
+    @Published var sendingToID: String? = nil
+    /// 所选内容还在后台读取（视频导出/大文件复制），此时点设备要给「请稍等」而不是「没选内容」
+    @Published var preparing = false
     /// 已选待发送内容的摘要，如「已选 3 项」
     @Published var pendingSummary = ""
     /// 从分享扩展收到的待发送项
@@ -143,6 +149,8 @@ final class Engine: ObservableObject {
     private func endTx(ok: Bool, msg: String) {
         DispatchQueue.main.async {
             self.txActive = false; self.paused = false
+            // 发送结束（成功/失败/超时）即解除设备行锁定，允许重试
+            if self.txUp { self.sendingToID = nil }
             if ok && self.txTotal > 0 { self.progress = "(\(self.txTotal)/\(self.txTotal)) 完成" }
             else if msg != "接收中断" && !msg.hasPrefix("已终止") { self.progress = "" }
         }
@@ -155,6 +163,7 @@ final class Engine: ObservableObject {
     func abortTx() {
         if txUp { sender.abort() } else { receiver.abort() }
         txActive = false; paused = false; progress = ""
+        if txUp { sendingToID = nil }   // 终止后立刻解锁设备行，可以马上重试
     }
 
     /// 可选出口：把最近收到的文件另存到别处（如 iCloud 云盘）。
@@ -439,6 +448,77 @@ final class Engine: ObservableObject {
         pendingItems = items
         DispatchQueue.main.async { self.pendingSummary = items.isEmpty ? "" : summary }
     }
+
+    /// 收录「文件」选择器选中的文件：解析安全作用域 → **复制进本 App 的临时槽位**。
+    ///
+    /// ★ v41 修「明明显示已选 1 个文件，点设备就报『没有可发送的内容（文件均已失效）』」：
+    ///   `UIDocumentPickerViewController(forOpeningContentTypes:asCopy:true)` 回来的 URL 并不保证
+    ///   真在沙盒内 —— iCloud Drive、其它 App 的容器、部分系统 provider 即使 asCopy 也仍是
+    ///   **安全作用域 URL**。旧实现直接把这种 URL 塞进 pendingItems，发送前预校验
+    ///   `isReadableFile` 必然 false（未 startAccessing 就没有读权限）→ 整批被判失效。
+    ///   现在统一 startAccessing → 复制到自己的 tempSlot → 用副本，跟照片路径保持一致。
+    ///   复制放后台：几十 MB 的 ipa 在主线程复制会卡住界面（用户点了没反应）。
+    func prepareDocuments(_ urls: [URL], done: @escaping () -> Void) {
+        guard !urls.isEmpty else { done(); return }
+        preparing = true
+        status = "正在读取 \(urls.count) 个文件…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fm = FileManager.default
+            var okURLs: [URL] = []
+            var fails: [String] = []
+            for src in urls {
+                let name = src.lastPathComponent.isEmpty ? "未命名文件" : src.lastPathComponent
+                // 安全作用域：asCopy 的真沙盒路径会返回 false，此时无需 stop
+                let scoped = src.startAccessingSecurityScopedResource()
+                defer { if scoped { src.stopAccessingSecurityScopedResource() } }
+
+                guard fm.fileExists(atPath: src.path) else {
+                    fails.append("\(name)（文件不存在）")
+                    continue
+                }
+                // iCloud 里「未下载」的占位文件：先请求下载，再等它落地（最多 5s）
+                if !fm.isReadableFile(atPath: src.path) {
+                    try? fm.startDownloadingUbiquitousItem(at: src)
+                    var tries = 0
+                    while !fm.isReadableFile(atPath: src.path) && tries < 25 {
+                        Thread.sleep(forTimeInterval: 0.2)
+                        tries += 1
+                    }
+                }
+                // ★ 独立 UUID 子目录、保留原名（发送时对端看到的文件名就是原名）
+                let dst = Engine.makeTempSlot(for: name)
+                try? fm.removeItem(at: dst)
+                do {
+                    try fm.copyItem(at: src, to: dst)
+                    let sz = ((try? fm.attributesOfItem(atPath: dst.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                    guard sz > 0 else {
+                        try? fm.removeItem(at: dst)
+                        fails.append("\(name)（0 字节，可能是空文件或尚未下载完）")
+                        continue
+                    }
+                    okURLs.append(dst)
+                } catch {
+                    fails.append("\(name)（\(error.localizedDescription)）")
+                }
+            }
+            DispatchQueue.main.async {
+                self.preparing = false
+                if !okURLs.isEmpty {
+                    self.setPending(okURLs.map { .file($0) }, summary: "已选 \(okURLs.count) 个文件")
+                }
+                if fails.isEmpty {
+                    self.status = okURLs.isEmpty ? "没有选中任何文件" : "已选 \(okURLs.count) 个文件，点下方设备发送"
+                } else {
+                    // ★ 失败绝不静默：旧行为是照常显示「已选 N 项」，用户以为能发，点了才发现发不出去
+                    self.status = okURLs.isEmpty
+                        ? "读取失败，未加入待发"
+                        : "已选 \(okURLs.count) 个文件，另有 \(fails.count) 个读取失败"
+                    self.addLog("以下文件未能加入待发：\(fails.joined(separator: "、"))")
+                }
+                done()
+            }
+        }
+    }
     // MARK: - 照片/视频装载
     //
     /// 「选视频+照片一起发，对方只收到照片」的排查结论（v34 修）：
@@ -558,7 +638,9 @@ final class Engine: ObservableObject {
     func preparePhotos(_ results: [PHPickerResult], done: @escaping () -> Void) {
         guard !results.isEmpty else { done(); return }
         let total = results.count
-        DispatchQueue.main.async { self.status = "正在读取 \(total) 项…" }
+        // ★ 读取期间置 preparing：此时点设备要提示「正在读取，请稍等」，
+        //   而不是旧版的「请先选择内容」——用户明明刚选完，提示却像是没选。
+        DispatchQueue.main.async { self.preparing = true; self.status = "正在读取 \(total) 项…" }
 
         // 先在主线程把每项的 (provider, 类型) 解析出来（轻量，不涉 IO）
         var jobs: [(idx: Int, provider: NSItemProvider, typeID: String, isVideo: Bool)] = []
@@ -599,6 +681,7 @@ final class Engine: ObservableObject {
         for _ in 0..<min(maxConcurrent, jobs.count) { dispatchNext() }
 
         group.notify(queue: .main) {
+            self.preparing = false
             let ok = slots.compactMap { $0 }
             let failedList = failed.sorted()
             if ok.isEmpty {
@@ -622,22 +705,53 @@ final class Engine: ObservableObject {
     }
 
     /// 点设备 → 发送暂存内容（先选类型内容，再点设备发出）
+    ///
+    /// ★ v41 修「点设备没反应，连点几下才突然开始发」：
+    ///   旧实现的可视反馈全靠 `sender.onStart`（TCP ready + 握手 ACK 之后才亮），
+    ///   连接/超时那十几秒里界面完全静止；而且没有重入保护，每点一下都新建一条连接，
+    ///   全部写进同一个 conn 字段互相踩。现在：点下即置「连接中」+ 设备行转圈禁点，
+    ///   并在调用层就把重复点击挡掉（`sendingToID`/`txActive` 非空直接提示）。
     func sendPending(to dev: DeviceInfo, host: String) {
-        if pendingItems.isEmpty {
-            DispatchQueue.main.async { self.status = "请先在顶部选择要发送的内容（照片/文件/文本）" }
+        if sendingToID != nil || txActive {
+            status = "正在发送，请稍候…"
+            addLog("上一条还没结束，等它完成再点设备")
+            return
+        }
+        if preparing {
+            status = "正在读取所选内容，请稍等…"
+            addLog("所选内容还在读取（大视频导出较慢），顶部显示「已选 N 项」后再点设备")
+            return
+        }
+        guard !pendingItems.isEmpty else {
+            status = "请先在顶部选择要发送的内容（照片/文件/文本）"
+            addLog("还没有待发内容：先点「照片 / 文件 / 文本」选好，再点设备")
             return
         }
         let items = pendingItems
+        beginSend(to: dev, host: host, items: items) { ok in
+            // ★ 成功才清空暂存 + 清理临时副本；失败保留，用户可直接重试，不用重新选一遍
+            if ok {
+                self.pendingItems = []
+                self.pendingSummary = ""
+                self.clearPendingTempFiles()
+            } else {
+                self.status = "发送未完成，已选内容仍保留，可重试"
+            }
+        }
+    }
+
+    /// 统一的「点设备 → 发送」入口：**立刻**给出连接中反馈 + 锁设备行 + 防重入。
+    /// sendPending / sendShared 共用，避免两条路径各写一套反馈。
+    private func beginSend(to dev: DeviceInfo, host: String, items: [SendItem], done: @escaping (Bool) -> Void) {
+        sendingToID = dev.id
+        txActive = true; txUp = true; txTotal = items.count; paused = false
+        status = "正在连接 \(dev.name)…"
+        progress = "连接中…"
+        addLog("准备发送 \(items.count) 项 → \(dev.name)（\(host)），正在连接…")
         sender.send(host: host, port: dev.port, peerName: dev.name, items: items) { ok in
             DispatchQueue.main.async {
-                // ★ 成功才清空暂存 + 清理临时副本；失败保留，用户可直接重试，不用重新选一遍
-                if ok {
-                    self.pendingItems = []
-                    self.pendingSummary = ""
-                    self.clearPendingTempFiles()
-                } else {
-                    self.status = "发送未完成，已选内容仍保留，可重试"
-                }
+                self.sendingToID = nil
+                done(ok)
             }
         }
     }
@@ -718,6 +832,10 @@ final class Engine: ObservableObject {
     /// 把分享来的内容发给指定设备（发送后自动清空本次分享）
     func sendShared(to dev: DeviceInfo, host: String) {
         guard !sharedItems.isEmpty else { return }
+        if sendingToID != nil || txActive {
+            addLog("上一条还没结束，等它完成再点设备")
+            return
+        }
         var items: [SendItem] = []
         for it in sharedItems {
             if it.kind == "text", let t = it.text { items.append(.text(t)) }
@@ -726,11 +844,9 @@ final class Engine: ObservableObject {
         guard !items.isEmpty else { dismissShareInbox(); return }
         // 先清空：无论发送成功与否，这次分享都已经结束
         dismissShareInbox()
-        sender.send(host: host, port: dev.port, peerName: dev.name, items: items) { ok in
-            DispatchQueue.main.async {
-                self.addLog(ok ? "分享内容已全部发送" : "分享内容发送失败")
-                if ok { self.clearPendingTempFiles() }
-            }
+        beginSend(to: dev, host: host, items: items) { ok in
+            self.addLog(ok ? "分享内容已全部发送" : "分享内容发送失败")
+            if ok { self.clearPendingTempFiles() }
         }
     }
 
@@ -813,7 +929,12 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showDoc) {
-            DocPicker { urls in engine.setPending(urls.map { .file($0) }, summary: "已选 \(urls.count) 个文件"); showDoc = false }
+            // ★ 先关 sheet 再收录：复制放到后台，大文件（几十 MB）不卡界面；
+            //   直接 setPending(urls) 用 picker 给的 URL 会因安全作用域读不了，详见 prepareDocuments。
+            DocPicker { urls in
+                showDoc = false
+                engine.prepareDocuments(urls) { }
+            }
         }
         .sheet(isPresented: $showText) {
             TextInputSheet(text: $textDraft) { txt in
@@ -912,21 +1033,29 @@ struct ContentView: View {
         }
     }
     private func devRow(_ d: Engine.DeviceInfo, _ host: String) -> some View {
-        Button { engine.sendPending(to: d, host: host) } label: {
+        // ★ 该行正在发送（含「连接中」）：立刻显示转圈并禁用，点下去马上有视觉回应，
+        //   也不会被连点成多条并发连接。
+        let busy = engine.sendingToID == d.id
+        return Button { engine.sendPending(to: d, host: host) } label: {
             HStack(spacing: 10) {
                 Image(systemName: d.isComputer ? "desktopcomputer" : "iphone")
                     .font(.title3).frame(width: 28)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("\(d.name)").font(.subheadline.weight(.medium))
-                    Text(host).font(.caption2).foregroundColor(.secondary)
+                    Text(busy ? "正在连接/发送…" : host).font(.caption2).foregroundColor(.secondary)
                 }
                 Spacer()
-                Image(systemName: "arrow.up.circle.fill").foregroundColor(.accentColor)
+                if busy {
+                    ProgressView().scaleEffect(0.8)
+                } else {
+                    Image(systemName: "arrow.up.circle.fill").foregroundColor(.accentColor)
+                }
             }
             .padding(.horizontal).padding(.vertical, 6)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(busy)
     }
 
     private var transferBar: some View {

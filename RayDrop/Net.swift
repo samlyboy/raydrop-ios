@@ -808,20 +808,92 @@ final class RDSender {
     private var conn: NWConnection?
     private var paused = false, aborted = false, finished = false
 
+    /// ★ v41：发送权 + 一次性回调保护 + 连接看门狗。
+    ///   旧实现没有任何重入保护：用户在「点了没反应」的十几秒里连点几下，
+    ///   每一下都会新建一条 NWConnection 并写进**同一个 conn 字段**；
+    ///   随后两条 Task 同时用 `conn!` 往同一条连接写 → 长度前缀和数据块互相穿插 →
+    ///   接收端解析错位、界面长时间不动，表现就是「不知道点到第几下才突然开始发」。
+    private let stateLock = NSLock()
+    private var busy = false          // 同一时刻只允许一条发送连接
+    private var doneServed = false     // done 只回调一次
+    private var reported = false       // onStatus/onEnd 只报一次
+    private var connected = false      // 已进入 ready（看门狗据此判定是否超时）
+    private var watchDog: DispatchWorkItem?
+    /// 连接代际：每起一条新连接 +1。旧 Task 只要发现代际变了就立刻退出，
+    /// 否则「终止后马上重发」时，旧 Task 会继续用 `conn!` 往**新连接**里写，把新一批数据写乱。
+    private var gen = 0
+
+    var isBusy: Bool { stateLock.lock(); defer { stateLock.unlock() }; return busy }
+
     func pause() { paused = true }
     func resume() { paused = false }
-    func abort() { aborted = true; paused = false; conn?.cancel() }
+    /// 终止：递增代际（旧 Task 所有检查点立即失效 + 不释放新一代的状态），然后关连接。
+    /// 因为旧 Task 已无法再碰到任何共享状态，这里可以**立刻**放开重发，用户点「终止」后可马上重试。
+    func abort() {
+        aborted = true; paused = false
+        stateLock.lock()
+        gen += 1
+        busy = false
+        watchDog?.cancel()
+        stateLock.unlock()
+        conn?.cancel()
+    }
+
+    /// 本次发送是否仍是「当前连接」（代际匹配且未被收尾）
+    private func stillMine(_ g: Int) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return gen == g && !reported
+    }
 
     private func waitIfPaused() async {
         while paused && !aborted { try? await Task.sleep(nanoseconds: 120_000_000) }
     }
-    private func stop(_ why: String, _ done: @escaping (Bool) -> Void) {
+    private func releaseBusy() {
+        stateLock.lock(); busy = false; watchDog?.cancel(); stateLock.unlock()
+    }
+    /// done 只回调一次（成功/失败/超时/取消可能同时到达，重复回调会让上层状态互相覆盖）
+    private func serveDone(_ done: @escaping (Bool) -> Void, _ ok: Bool) {
+        stateLock.lock()
+        if doneServed { stateLock.unlock(); return }
+        doneServed = true
+        stateLock.unlock()
+        done(ok)
+    }
+    /// 收尾（失败/超时/取消）。★ 带代际校验：过期任务一律静默返回 ——
+    /// 否则「终止后马上重发」时，旧任务会把新一代的 reported/finished 置脏、把新一代的锁释放掉。
+    private func stop(_ why: String, _ done: @escaping (Bool) -> Void, gen g: Int) {
+        stateLock.lock()
+        if g != gen { stateLock.unlock(); return }
+        let first = !reported
+        reported = true
+        stateLock.unlock()
         finished = true
-        onStatus(why); onEnd(false, why); done(false)
+        releaseBusy()
+        if first { onStatus(why); onEnd(false, why) }
+        serveDone(done, false)
     }
 
     func send(host: String, port: UInt16, peerName: String, items: [SendItem], done: @escaping (Bool) -> Void) {
-        aborted = false; paused = false; finished = false
+        // ---- 第一道闸：调用层重入拦截（连点几下只会真正起一条连接）----
+        stateLock.lock()
+        let wasBusy = busy
+        if !wasBusy {
+            busy = true
+            doneServed = false
+            reported = false
+            connected = false
+            aborted = false
+            paused = false
+            finished = false
+            gen += 1
+        }
+        let myGen = gen
+        stateLock.unlock()
+        if wasBusy {
+            onStatus("上一条还在发送，请稍候…")
+            done(false)
+            return
+        }
 
         // ★ 发前预校验：逐项确认文件真实可读、大小 > 0。
         //   旧实现把 `try FileHandle(forReadingFrom:)` 放在循环里抛，**任意一项打不开就整批中断** ——
@@ -846,39 +918,66 @@ final class RDSender {
         if !skipped.isEmpty {
             onStatus("有 \(skipped.count) 项无法读取，已跳过：\(skipped.joined(separator: "、"))")
         }
-        guard !checked.isEmpty else { stop("没有可发送的内容（文件均已失效）", done); return }
+        guard !checked.isEmpty else { stop("没有可发送的内容（文件均已失效）", done, gen: myGen); return }
+
+        // ★ 立刻让界面知道「已开始动作」——在这之前界面要到 TCP 连上并握手成功才有变化，
+        //   若对端 App 被挂起、接收服务没起来，SYN 要重传十几秒以上，用户看到的就是「点了没反应」。
+        onStatus("正在连接 \(peerName)…")
 
         let nw = NWEndpoint.Host(host)
         let p = NWEndpoint.Port(rawValue: port)!
         let c = NWConnection(host: nw, port: p, using: .tcp)
         conn = c
         c.stateUpdateHandler = { (st: NWConnection.State) in
-            if case .ready = st { self.doSend(peer: peerName, items: checked, done: done) }
-            else if case .failed = st { if self.aborted { self.stop("已终止", done) } else { self.stop("连接失败", done) } }
-            else if case .cancelled = st { if self.aborted && !self.finished { self.stop("已终止", done) } }
+            if case .ready = st {
+                self.stateLock.lock(); self.connected = true; self.watchDog?.cancel(); self.stateLock.unlock()
+                self.doSend(peer: peerName, items: checked, done: done, gen: myGen)
+            }
+            else if case .failed = st { if self.aborted { self.stop("已终止", done, gen: myGen) } else { self.stop("连接失败", done, gen: myGen) } }
+            else if case .cancelled = st { if self.aborted && !self.finished { self.stop("已终止", done, gen: myGen) } }
         }
         c.start(queue: DispatchQueue.global())
+
+        // ★ 12s 连接看门狗：LAN 内正常几十毫秒就 ready，迟迟不 ready 说明对端根本没接
+        //   （App 被挂起 / 接收服务没起来）。旧实现靠 TCP 自身超时，最长 75s 界面一动不动，
+        //   用户只能反复乱点。现在到点主动给结论，并放开重试。
+        let wd = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let stillWaiting = !self.connected
+            self.stateLock.unlock()
+            guard stillWaiting else { return }
+            self.stop("连接 \(peerName) 超时（\(host)：对方可能不在线，或接收服务未就绪）", done, gen: myGen)
+            self.conn?.cancel()
+        }
+        stateLock.lock(); watchDog = wd; stateLock.unlock()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 12, execute: wd)
     }
 
-    private func doSend(peer: String, items: [SendItem], done: @escaping (Bool) -> Void) {
+    private func doSend(peer: String, items: [SendItem], done: @escaping (Bool) -> Void, gen myGen: Int) {
+        // 已被超时/取消收尾的连接，即使迟到 ready 也不再进入发送流程
+        guard stillMine(myGen) else { return }
+        // ★ 捕获本条连接：`conn` 字段可能被后续 send 覆盖，旧 Task 绝不能写到别人的连接上
+        guard let c = conn else { return }
         Task {
             // 发送端等 ACK 时，对面可能正在把大视频写进相册（几 GB 要几十秒）→ 给足 10 分钟
-            let s = RDStream(conn!, stallTimeout: 600)
+            let s = RDStream(c, stallTimeout: 600)
             do {
-                RDWrite.line(conn!, ["app": RD.app, "v": RD.ver, "name": RDStore.shared.myName,
-                                      "code": RDStore.shared.myCode, "count": items.count])
+                RDWrite.line(c, ["app": RD.app, "v": RD.ver, "name": RDStore.shared.myName,
+                                 "code": RDStore.shared.myCode, "count": items.count])
                 let repLine = try await s.readLine()
                 guard let repData = repLine.data(using: .utf8),
                       let rep = try? JSONSerialization.jsonObject(with: repData) as? [String: Any],
                       (rep["ok"] as? Bool) == true else {
                     let reason = repLine.contains("untrusted") ? "对方未信任你的码" : "被拒绝"
-                    self.stop(reason, done); s.close(); return
+                    self.stop(reason, done, gen: myGen); s.close(); return
                 }
                 self.onStart(peer, items.count)
 
                 for (i, item) in items.enumerated() {
                     await self.waitIfPaused()
-                    if self.aborted { self.stop("已终止", done); s.close(); return }
+                    guard self.stillMine(myGen) else { s.close(); return }
+                    if self.aborted { self.stop("已终止", done, gen: myGen); s.close(); return }
                     var name: String, mime: String, kind: String, size: Int
                     var handle: FileHandle? = nil
                     var textData: Data? = nil
@@ -893,8 +992,8 @@ final class RDSender {
                               let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
                               let sz64 = (attrs[.size] as? NSNumber)?.int64Value else {
                             self.onStatus("跳过（无法读取）：\(url.lastPathComponent)")
-                            RDWrite.lenJSON(conn!, ["name": name, "size": 0, "mime": mime,
-                                                    "kind": "skip", "index": i, "total": items.count])
+                            RDWrite.lenJSON(c, ["name": name, "size": 0, "mime": mime,
+                                                "kind": "skip", "index": i, "total": items.count])
                             _ = try? await s.readLine()      // 等对方 ACK，保持对齐
                             continue
                         }
@@ -907,12 +1006,13 @@ final class RDSender {
                         textData = Data(str.utf8)
                         size = textData!.count
                     }
-                    RDWrite.lenJSON(conn!, ["name": name, "size": size, "mime": mime, "kind": kind, "index": i, "total": items.count])
+                    RDWrite.lenJSON(c, ["name": name, "size": size, "mime": mime, "kind": kind, "index": i, "total": items.count])
                     var off = 0, lastTick = Date(), lastB = 0, spd = 0.0
                     var shortRead = false
                     while off < size {
                         await self.waitIfPaused()
-                        if self.aborted { try? handle?.close(); self.stop("已终止", done); s.close(); return }
+                        guard self.stillMine(myGen) else { try? handle?.close(); s.close(); return }
+                        if self.aborted { try? handle?.close(); self.stop("已终止", done, gen: myGen); s.close(); return }
                         let want = min(RD.chunkSize, size - off)
                         let chunk: Data
                         if let h = handle { chunk = h.readData(ofLength: want) }
@@ -922,7 +1022,7 @@ final class RDSender {
                         //   阻塞等剩下的字节（它不知道发送端已经放弃）→ 整条传输卡死、后续文件全丢。
                         //   现在必须让错误可见：关连接，让接收端读到 closed 并结束本次接收。
                         if chunk.isEmpty { shortRead = true; break }
-                        try await self.sendChunk(chunk)   // 背压：等这块发完再发下一块
+                        try await self.sendChunk(chunk, on: c)   // 背压：等这块发完再发下一块
                         off += chunk.count
                         let now = Date(); let dt = now.timeIntervalSince(lastTick)
                         if dt >= 0.2 {
@@ -933,7 +1033,8 @@ final class RDSender {
                     }
                     try? handle?.close()
                     if shortRead {
-                        self.stop("发送中断：\(name) 只读到 \(off)/\(size) 字节（文件可能被系统清理或损坏）", done)
+                        guard self.stillMine(myGen) else { s.close(); return }
+                        self.stop("发送中断：\(name) 只读到 \(off)/\(size) 字节（文件可能被系统清理或损坏）", done, gen: myGen)
                         s.close(); return
                     }
                     let ackLine = try await s.readLine()   // ACK：收完才发下一个
@@ -946,22 +1047,26 @@ final class RDSender {
                     }
                     self.onStatus("已发送 \(name)")
                 }
-                RDWrite.line(conn!, ["done": true])
+                RDWrite.line(c, ["done": true])
                 _ = try? await s.readLine()
                 self.finished = true
+                self.stateLock.lock(); self.reported = true; self.stateLock.unlock()
+                self.releaseBusy()
                 self.onStatus("发送完成：\(items.count) 项")
                 self.onEnd(true, "发送完成")
-                done(true)
+                self.serveDone(done, true)
             } catch {
-                if self.aborted { self.stop("已终止", done) } else { self.stop("发送失败", done) }
+                // 代际已变（用户终止后重发/超时收尾）→ 这次 Task 只负责静默退出，不能去改新连接的状态
+                guard self.stillMine(myGen) else { s.close(); return }
+                if self.aborted { self.stop("已终止", done, gen: myGen) } else { self.stop("发送失败", done, gen: myGen) }
             }
             s.close()
         }
     }
 
-    private func sendChunk(_ d: Data) async throws {
+    private func sendChunk(_ d: Data, on c: NWConnection) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            conn!.send(content: d, completion: .contentProcessed { err in
+            c.send(content: d, completion: .contentProcessed { err in
                 if let err = err { cont.resume(throwing: err) } else { cont.resume() }
             })
         }
