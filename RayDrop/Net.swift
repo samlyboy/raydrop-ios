@@ -191,11 +191,23 @@ final class RDDiscovery {
     }
 
     private func announcement() -> Data? {
+        // ★ v43.2：监听还没就绪（port == 0）时**一个字都不发**。
+        //
+        //   旧实现无条件把 portProvider() 塞进报文，未就绪时就是 "port": 0。
+        //   Windows 端拿这个 0 去 connect()，系统立刻返回
+        //   WSAEADDRNOTAVAIL(10049)「在其上下文中，该请求的地址无效」——
+        //   表现就是「点设备立刻失败，连超时等待都没有」。
+        //   iOS 15 上监听起得慢，这个窗口还更长。
+        //
+        //   宁可这一轮不公告（对端暂时看不到本机），也绝不广播一个不可连接的端口；
+        //   监听一就绪，onListening 回调会立刻补发一轮公告，设备马上重新出现。
+        let p = portProvider()
+        guard p != 0 else { return nil }
         let me: [String: Any] = [
             "app": RD.app, "v": 2, "name": RDStore.shared.myName,
             "code": RDStore.shared.myCode, "did": RDStore.shared.deviceId,
             "platform": "iOS",
-            "port": Int(portProvider()), "ips": RDIP.ips()
+            "port": Int(p), "ips": RDIP.ips()
         ]
         return try? JSONSerialization.data(withJSONObject: me)
     }
