@@ -30,6 +30,16 @@ import UniformTypeIdentifiers
 ///    `UIImageWriteToSavedPhotosAlbum` —— iOS 最老的存图存视频接口，兼容性最好。
 ///    视频那条是**整文件拷贝、不改字节**；图片那条会由系统重新编码一次，仅在全部 PhotoKit
 ///    路径都失败时使用（有总比彻底没有好），日志里会标明走了兜底。
+/// 6. **v39 两个真机故障（iOS 17 → iOS 15 视频不进相册，反向正常）**：
+///    ① **假成功**：`performChanges` 回 `ok=true` 只代表 change block 没抛异常。创建请求返回
+///       nil 时 block 里什么都没做，系统照样回 ok → 旧代码 `done(true, "")`，日志打「已存相册」
+///       而相册里没有，且**后面四条兜底全被跳过**（iOS 17 上第一条策略直接成功，所以只有
+///       老系统暴露）。对策：必须拿到 placeholder（真实资产 id）才算写入成功。
+///    ② **名字与字节不一致**：`originalFilename` 沿用对端原名（可能是 `.mp4`），而真实容器是
+///       MOV。iOS 15 严格按名字校验 → 直接拒收（错误只剩 `PHPhotosErrorDomain#-1`）；iOS 17 宽容。
+///       对策：`originalFilename` 的后缀改成嗅探出的真实容器。
+///    另外把苹果标准入口 `creationRequestForAssetFromVideo` 提到第一位、补一条「视频字节直写」，
+///    并让临时副本走**硬链接**（几 GB 视频不再整份复制）。
 enum RDMediaSaver {
 
     typealias Done = (Bool, String) -> Void
@@ -135,32 +145,19 @@ enum RDMediaSaver {
         let uti = UTType(filenameExtension: ext)?.identifier
             ?? UTType(mimeType: mime)?.identifier
             ?? (isVideo ? UTType.quickTimeMovie.identifier : UTType.jpeg.identifier)
+        // ★ v39：交给 PhotoKit 的 originalFilename 后缀**必须与真实容器一致**。
+        //   iOS 15 对「名字说 mp4、字节是 mov」这种情况会直接拒收（错误只剩 PHPhotosErrorDomain#-1），
+        //   而 iOS 17 会宽容地按字节判。只改名字，不改一个字节。
+        let baseName = (name as NSString).deletingPathExtension
+        let albumName = (baseName.isEmpty ? "RayDrop" : baseName) + "." + ext
 
         var attempts: [Attempt] = []
 
         if isVideo {
-            // ① 不给 UTI：让 PhotoKit 自己按真实字节判容器（最贴近「原样入库」）
-            attempts.append { done in
-                let o = PHAssetResourceCreationOptions()
-                o.originalFilename = name
-                commit(isVideo: true) { pid in
-                    let req = PHAssetCreationRequest.forAsset()
-                    req.addResource(with: .video, fileURL: src, options: o)
-                    pid = req.placeholderForCreatedAsset?.localIdentifier
-                } done: { done($0, $1) }
-            }
-            // ② 给按真实容器推出的 UTI
-            attempts.append { done in
-                let o = PHAssetResourceCreationOptions()
-                o.originalFilename = name
-                o.uniformTypeIdentifier = uti
-                commit(isVideo: true) { pid in
-                    let req = PHAssetCreationRequest.forAsset()
-                    req.addResource(with: .video, fileURL: src, options: o)
-                    pid = req.placeholderForCreatedAsset?.localIdentifier
-                } done: { done($0, $1) }
-            }
-            // ③ 苹果的「把视频文件加进相册」标准入口
+            // ★ v39 顺序重排：苹果「把视频文件加进相册」的标准入口放到**第一位**。
+            //   它是 iOS 上最老、兼容性最好的写视频路径（iOS 15 上实测比 addResource 稳），
+            //   旧版把它排第三，前面两条一旦「假成功」就轮不到它 —— 见 commit() 的 pid 校验。
+            // ① 苹果标准入口：creationRequestForAssetFromVideo（系统自己做容器校验）
             attempts.append { done in
                 commit(isVideo: true) { pid in
                     if let req = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: src) {
@@ -168,17 +165,56 @@ enum RDMediaSaver {
                     }
                 } done: { done($0, $1) }
             }
-            // ④ 换成临时目录里的干净文件名再试一次（排除文件名/路径引起的拒收）
+            // ② 不给 UTI：让 PhotoKit 自己按真实字节判容器（最贴近「原样入库」）
+            attempts.append { done in
+                let o = PHAssetResourceCreationOptions()
+                o.originalFilename = albumName
+                commit(isVideo: true) { pid in
+                    let req = PHAssetCreationRequest.forAsset()
+                    req.addResource(with: .video, fileURL: src, options: o)
+                    pid = req.placeholderForCreatedAsset?.localIdentifier
+                } done: { done($0, $1) }
+            }
+            // ③ 给按真实容器推出的 UTI
+            attempts.append { done in
+                let o = PHAssetResourceCreationOptions()
+                o.originalFilename = albumName
+                o.uniformTypeIdentifier = uti
+                commit(isVideo: true) { pid in
+                    let req = PHAssetCreationRequest.forAsset()
+                    req.addResource(with: .video, fileURL: src, options: o)
+                    pid = req.placeholderForCreatedAsset?.localIdentifier
+                } done: { done($0, $1) }
+            }
+            // ④ 字节直写：完全绕开「文件路径 / 后缀 / 沙盒可读性」，写进去的还是原始字节。
+            //    路径类写法在个别系统版本上会因为临时目录权限或 URL 指向被拒，这条能兜住。
+            //    视频可能很大，加 256MB 上限，避免整文件读进内存把 App 撑爆。
+            attempts.append { done in
+                let size = ((try? FileManager.default.attributesOfItem(atPath: src.path))?[.size] as? NSNumber)?.intValue ?? 0
+                guard size > 0, size <= 256 * 1024 * 1024 else {
+                    done(false, "文件 \(size / 1048576)MB，跳过字节直写"); return
+                }
+                guard let data = try? Data(contentsOf: src), !data.isEmpty else {
+                    done(false, "读不出文件内容"); return
+                }
+                let o = PHAssetResourceCreationOptions()
+                o.originalFilename = albumName
+                o.uniformTypeIdentifier = uti
+                commit(isVideo: true) { pid in
+                    let req = PHAssetCreationRequest.forAsset()
+                    req.addResource(with: .video, data: data, options: o)
+                    pid = req.placeholderForCreatedAsset?.localIdentifier
+                } done: { done($0, $1) }
+            }
+            // ⑤ 换成临时目录里的干净文件名再试一次（排除文件名/路径引起的拒收）
             attempts.append { done in
                 guard let clean = copyToTemp(src, ext: ext) else {
                     done(false, "无法创建临时副本"); return
                 }
-                let o = PHAssetResourceCreationOptions()
-                o.originalFilename = "raydrop." + ext
                 commit(isVideo: true) { pid in
-                    let req = PHAssetCreationRequest.forAsset()
-                    req.addResource(with: .video, fileURL: clean, options: o)
-                    pid = req.placeholderForCreatedAsset?.localIdentifier
+                    if let req = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: clean) {
+                        pid = req.placeholderForCreatedAsset?.localIdentifier
+                    }
                 } done: { ok, detail in
                     // ⚠️ 必须等 PhotoKit 真正做完再删副本：performChanges 是异步的，
                     //    用 defer 会在它读文件之前就把副本删掉。
@@ -186,7 +222,7 @@ enum RDMediaSaver {
                     done(ok, detail)
                 }
             }
-            // ⑤ 最后兜底：老接口，整文件拷贝入库（不改字节），iOS 15 上最稳
+            // ⑥ 最后兜底：老接口，整文件拷贝入库（不改字节），iOS 15 上兼容性最好
             attempts.append { done in
                 let ctx = LegacySaver.shared.reserve(done)
                 UISaveVideoAtPathToSavedPhotosAlbum(src.path, LegacySaver.shared,
@@ -197,7 +233,7 @@ enum RDMediaSaver {
             // ① 不给 UTI：HEIC 装成 .jpeg 这类「名实不符」的坑，交给系统嗅探最保险
             attempts.append { done in
                 let o = PHAssetResourceCreationOptions()
-                o.originalFilename = name
+                o.originalFilename = albumName
                 commit(isVideo: false) { pid in
                     let req = PHAssetCreationRequest.forAsset()
                     req.addResource(with: .photo, fileURL: src, options: o)
@@ -210,7 +246,7 @@ enum RDMediaSaver {
                     done(false, "读不出文件内容"); return
                 }
                 let o = PHAssetResourceCreationOptions()
-                o.originalFilename = name
+                o.originalFilename = albumName
                 o.uniformTypeIdentifier = uti
                 commit(isVideo: false) { pid in
                     let req = PHAssetCreationRequest.forAsset()
@@ -221,7 +257,7 @@ enum RDMediaSaver {
             // ③ fileURL + UTI
             attempts.append { done in
                 let o = PHAssetResourceCreationOptions()
-                o.originalFilename = name
+                o.originalFilename = albumName
                 o.uniformTypeIdentifier = uti
                 commit(isVideo: false) { pid in
                     let req = PHAssetCreationRequest.forAsset()
@@ -249,7 +285,16 @@ enum RDMediaSaver {
             }
         }
 
-        next(attempts, 0, [], completion)
+        // 全部失败时把「真实容器 + 大小」带上，真机排查时能直接判断是不是容器/编码不被支持
+        let madeTemp = (src != file)
+        next(attempts, 0, [], { ok, msg in
+            // 先取大小再清临时副本（顺序不能反，删掉就读不到了）
+            let sz = ((try? FileManager.default.attributesOfItem(atPath: src.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            if madeTemp { try? FileManager.default.removeItem(at: src) }
+            guard !ok else { completion(true, ""); return }
+            let mb = String(format: "%.1f", Double(sz) / 1048576.0)
+            completion(false, "[真实容器=\(ext) \(mb)MB] " + msg)
+        })
     }
 
     /// 依次尝试；全部失败时把每一步的原因拼起来回报
@@ -283,15 +328,24 @@ enum RDMediaSaver {
                 done(false, base + " [auth=\(auth)]")
                 return
             }
+            // ★★ v39 关键修复：`performChanges` 回 ok=true 只代表「change block 没抛异常」，
+            //    **不代表真的写进去了**。当创建请求自己返回 nil（老系统对某些容器/编码、
+            //    或文件路径不可读时会这样），block 里一个操作都没执行，系统照样回 ok=true。
+            //    旧代码在这里 `done(true, "")` → 日志打「已存相册」，相册里空空如也，
+            //    而且**后面四条兜底策略全被跳过**。这正是 iOS 15 上「视频显示已存、相册没有」的成因。
+            //    修法：必须先拿到 placeholder（真实资产 id）才算写入成功，否则判失败、继续走下一策略。
+            guard let id = pid, !id.isEmpty else {
+                done(false, "系统未创建相册资产（creationRequest 返回 nil，本机可能不支持该容器/编码）")
+                return
+            }
             // ⚠️ 只有**确实拿到读权限**才能 fetch。否则在 iOS 17 上会因缺少
             //    NSPhotoLibraryUsageDescription 被 TCC 直接杀进程（用户看到的就是「收完闪退」）。
             guard canReadLibrary() else {
-                done(true, "")     // 没有读权限：以 performChanges 成功为准，不越权回查
+                done(true, "")     // 没有读权限：placeholder 已拿到 = 确实入库，不做越权回查
                 return
             }
-            guard let id = pid,
-                  let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
-                done(true, "")     // 拿不到 id 就无法回查，按成功处理（文件确实在相册里）
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
+                done(true, "")     // 拿到 placeholder 但查不到：以创建成功为准
                 return
             }
             let want: PHAssetMediaType = isVideo ? .video : .image
@@ -322,6 +376,10 @@ enum RDMediaSaver {
     private static func copyToTemp(_ file: URL, ext: String) -> URL? {
         let dst = FileManager.default.temporaryDirectory
             .appendingPathComponent("rd_album_" + UUID().uuidString + "." + ext)
+        // ★ v39：优先**硬链接** —— 同一沙盒卷内只是加一个目录项，几 GB 的视频也是瞬间完成、
+        //   不占额外空间（旧写法整份 copy，2GB 视频要复制一遍、慢且吃磁盘）。
+        //   硬链接失败（跨卷等）再退回真实拷贝。
+        if (try? FileManager.default.linkItem(at: file, to: dst)) != nil { return dst }
         do {
             try FileManager.default.copyItem(at: file, to: dst)
             return dst
