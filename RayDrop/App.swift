@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import PhotosUI
+import Photos
 import UniformTypeIdentifiers
 import UIKit
 
@@ -618,20 +619,31 @@ final class Engine: ObservableObject {
         }
     }
 
-    // MARK: - ★ v43 取文件：类型候选链 + 字节兜底 + 名字与字节对齐
+    // MARK: - ★ v44 取文件：先要「笼统类型」，再退具体类型，最后字节/相册资源兜底
 
     /// 一个 provider 的「可用类型候选」，按「最可能拿到原文件」排序。
     ///
-    /// 为什么要一整条链：真机上 iOS 15 对视频 `loadFileRepresentation` 会直接失败，
-    /// 而旧实现**只试一个**类型标识就放弃 → 用户看到「已选 1 项」，视频凭空消失。
-    /// 具体类型（com.apple.quicktime-movie 等）系统会直给原文件、不转码，所以排前面；
-    /// 笼统的 public.movie / public.image 排后面兜底。
+    /// ★ v44 的教训（真机日志原文）：
+    ///   `第 2 项视频 (public.mpeg-4: Cannot load representation of type public.mpeg-4; …)`
+    ///   `public.mpeg-4` 是**具体编码/容器**类型 —— 要它就意味着"必须给我这个格式"，
+    ///   而 picker 配的是 `preferredAssetRepresentationMode = .current`（不许转码），
+    ///   系统没有办法在不转码的前提下满足 → 直接报 Cannot load representation。
+    ///   笼统的 `public.movie` 不限制编码，系统把手里那份原文件交出来即可，不需要转码。
+    ///   所以顺序必须是：public.movie / public.image（笼统，零转换）→ provider 自报的具体类型
+    ///   → 其他编码类型 → 字节/相册资源兜底。旧顺序把具体类型放第一，等于自己踩雷。
     private static func typeCandidates(_ provider: NSItemProvider, primary: String, isVideo: Bool) -> [String] {
         var list: [String] = []
         func add(_ id: String) {
             guard !id.isEmpty, !list.contains(id) else { return }
             guard provider.hasItemConformingToTypeIdentifier(id) else { return }
             list.append(id)
+        }
+        if isVideo {
+            add(UTType.movie.identifier)               // ★ 第一档：笼统视频类型，不要求任何具体编码
+            add(UTType.audiovisualContent.identifier)
+            add(UTType.quickTimeMovie.identifier)
+        } else {
+            add(UTType.image.identifier)               // ★ 第一档：笼统图片类型
         }
         add(primary)
         for id in provider.registeredTypeIdentifiers {
@@ -643,7 +655,7 @@ final class Engine: ObservableObject {
             }
         }
         if isVideo {
-            for t in [UTType.quickTimeMovie, .mpeg4Movie, .movie, .video, .audiovisualContent] { add(t.identifier) }
+            for t in [UTType.mpeg4Movie, .video] { add(t.identifier) }
         } else {
             for t in [UTType.jpeg, .png, .heic, .gif, .webP, .tiff, .image] { add(t.identifier) }
         }
@@ -693,6 +705,64 @@ final class Engine: ObservableObject {
         }
     }
 
+    /// 第三条通道：`loadItem` 直接要「对象」（NSURL / NSData）。
+    /// 它和 `loadFileRepresentation` 走的是不同实现，iOS 15 上前者失败、后者能出东西的情况真实存在。
+    private static func awaitItem(_ provider: NSItemProvider, typeID: String,
+                                  isVideo: Bool, timeout: TimeInterval) async -> (URL?, String) {
+        await withCheckedContinuation { (cont: CheckedContinuation<(URL?, String), Never>) in
+            let once = Once<(URL?, String)>(cont)
+            provider.loadItem(forTypeIdentifier: typeID, options: nil) { item, err in
+                if let u = item as? URL {
+                    if let copy = Engine.copyIntoSandbox(u, isVideo: isVideo, typeID: typeID) { once.fire((copy, "")) }
+                    else { once.fire((nil, "复制进沙盒失败")) }
+                    return
+                }
+                if let d = item as? Data, !d.isEmpty {
+                    if let u = Engine.writeSandbox(d, typeID: typeID, isVideo: isVideo) { once.fire((u, "")) }
+                    else { once.fire((nil, "写沙盒失败")) }
+                    return
+                }
+                once.fire((nil, err.map { $0.localizedDescription } ?? "系统没有返回可用对象"))
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                once.fire((nil, "超过 \(Int(timeout)) 秒无响应"))
+            }
+        }
+    }
+
+    /// 最后兜底：**已有「读相册」权限**时，直接按 assetIdentifier 取该资产的原始资源写进沙盒。
+    /// `PHAssetResourceManager.writeData` 给出的是原始资源字节，不做任何转码。
+    /// 没有读权限就跳过（绝不弹新权限、绝不越权读 —— 越权在 iOS 17 上会被 TCC 直接杀进程）。
+    private static func awaitLibraryResource(assetID: String, isVideo: Bool,
+                                             timeout: TimeInterval) async -> (URL?, String) {
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
+            return (nil, "没有「读取相册」权限，跳过")
+        }
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
+        guard let asset = assets.firstObject else { return (nil, "按 id 找不到该资产") }
+        let all = PHAssetResource.assetResources(for: asset)
+        let wanted: [PHAssetResourceType] = isVideo ? [.fullSizeVideo, .video] : [.fullSizePhoto, .photo]
+        guard let res = all.first(where: { wanted.contains($0.type) }) else {
+            return (nil, "该资产没有可用资源")
+        }
+        var name = res.originalFilename
+        if (name as NSString).pathExtension.isEmpty {
+            name += "." + (UTType(res.uniformTypeIdentifier)?.preferredFilenameExtension ?? (isVideo ? "mov" : "jpg"))
+        }
+        let dst = makeTempSlot(for: name)
+        if FileManager.default.fileExists(atPath: dst.path) { try? FileManager.default.removeItem(at: dst) }
+        return await withCheckedContinuation { (cont: CheckedContinuation<(URL?, String), Never>) in
+            let once = Once<(URL?, String)>(cont)
+            PHAssetResourceManager.default().writeData(for: res, toFile: dst.path, options: nil) { err in
+                if let err = err { once.fire((nil, err.localizedDescription)) }
+                else { once.fire((dst, "")) }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                once.fire((nil, "写入超时"))
+            }
+        }
+    }
+
     /// 把内存字节写成沙盒文件（扩展名按类型标识补，没有就按视频/图片猜）
     private static func writeSandbox(_ data: Data, typeID: String, isVideo: Bool) -> URL? {
         let ext = UTType(typeID)?.preferredFilenameExtension ?? (isVideo ? "mov" : "jpg")
@@ -733,34 +803,63 @@ final class Engine: ObservableObject {
         }
     }
 
-    /// 取一项：类型候选链逐个试 file 通道，全失败再用 data 通道兜底。
-    /// 失败时把**每一步的真实原因**带回去（不再只说「第 1 项视频」）。
+    /// 取一项：file 通道 → loadItem 通道 → data 通道 → 相册原始资源，逐层兜底。
+    /// 失败时把**每一层的真实原因**带回去（不再只说「第 1 项视频」）。
     ///
-    /// 时长控制：整项设总预算（视频 240s / 照片 90s），第一档给足 180s
-    /// （iCloud 里未下载的大视频要等它落地），后续档位只给 25s ——
-    /// 失败的 provider 通常立刻报错，给它长超时只会白等，不能让用户对着界面干等十几分钟。
-    private static func loadOne(_ provider: NSItemProvider, typeID: String, isVideo: Bool) async -> (URL?, String) {
+    /// 时长控制：整项设总预算（视频 240s / 照片 90s），第一档给足 120s
+    /// （iCloud 里未下载的大视频要等它落地），后续档位只给 20s ——
+    /// 失败的 provider 通常立刻报错，给长超时只会白等。
+    private static func loadOne(_ provider: NSItemProvider, typeID: String, isVideo: Bool,
+                                assetID: String?) async -> (URL?, String) {
         var reasons: [String] = []
         let cands = typeCandidates(provider, primary: typeID, isVideo: isVideo)
         let deadline = Date().addingTimeInterval(isVideo ? 240 : 90)
+
+        // ① 要一份本地临时文件（最通用）
         for (n, id) in cands.enumerated() {
             let left = deadline.timeIntervalSinceNow
-            if left < 5 { break }
-            let budget = min(left, n == 0 ? 180 : 25)
-            let (u, why) = await awaitFile(provider, typeID: id, isVideo: isVideo, timeout: budget)
+            if left < 4 { break }
+            let (u, why) = await awaitFile(provider, typeID: id, isVideo: isVideo,
+                                           timeout: min(left, n == 0 ? 120 : 20))
             if let u = u { return (alignExtension(u), "") }
-            reasons.append("\(id)：\(why)")
+            reasons.append("file \(shortType(id))：\(why)")
         }
-        for (n, id) in cands.prefix(3).enumerated() {
+        // ② loadItem：和 ① 是两套实现，iOS 15 上常有 ① 失败 ② 成功的情况
+        for id in cands.prefix(2) {
             let left = deadline.timeIntervalSinceNow
-            if left < 5 { break }
-            let (d, why) = await awaitData(provider, typeID: id, timeout: min(left, n == 0 ? 120 : 20))
+            if left < 4 { break }
+            let (u, why) = await awaitItem(provider, typeID: id, isVideo: isVideo, timeout: min(left, 25))
+            if let u = u { return (alignExtension(u), "") }
+            reasons.append("item \(shortType(id))：\(why)")
+        }
+        // ③ 直接要字节
+        for id in cands.prefix(2) {
+            let left = deadline.timeIntervalSinceNow
+            if left < 4 { break }
+            let (d, why) = await awaitData(provider, typeID: id, timeout: min(left, 60))
             if let d = d, let u = writeSandbox(d, typeID: id, isVideo: isVideo) {
                 return (alignExtension(u), "")
             }
-            reasons.append("data \(id)：\(why)")
+            reasons.append("data \(shortType(id))：\(why)")
         }
-        return (nil, reasons.prefix(3).joined(separator: "；"))
+        // ④ 相册原始资源（只在已有读权限时；不弹新权限、不越权读）
+        if let aid = assetID {
+            let left = deadline.timeIntervalSinceNow
+            if left > 4 {
+                let (u, why) = await awaitLibraryResource(assetID: aid, isVideo: isVideo, timeout: min(left, 90))
+                if let u = u { return (alignExtension(u), "") }
+                reasons.append("相册资源：\(why)")
+            }
+        }
+        // 失败信息里带上对端自报的类型，下次一眼能看出它到底支持什么
+        let types = provider.registeredTypeIdentifiers.prefix(6).joined(separator: ",")
+        return (nil, reasons.prefix(4).joined(separator: "；") + "｜自报类型：\(types)")
+    }
+
+    /// 类型标识缩短成便于阅读的形式（public.mpeg-4 → mpeg-4），只为日志好读
+    private static func shortType(_ id: String) -> String {
+        id.replacingOccurrences(of: "public.", with: "")
+          .replacingOccurrences(of: "com.apple.", with: "")
     }
 
     /// 复制进沙盒临时槽位，并**保证有扩展名**（没有扩展名对端判不出 mime、也进不了相册）。
@@ -808,7 +907,7 @@ final class Engine: ObservableObject {
         status = "正在读取 \(total) 项…"
 
         // 类型解析放主线程做（纯查表，不涉 IO）
-        var jobs: [(idx: Int, provider: NSItemProvider, typeID: String, isVideo: Bool)] = []
+        var jobs: [(idx: Int, provider: NSItemProvider, typeID: String, isVideo: Bool, assetID: String?)] = []
         var errs: [Int: String] = [:]
         var kindOf: [Int: String] = [:]
         for (idx, r) in results.enumerated() {
@@ -817,7 +916,7 @@ final class Engine: ObservableObject {
                 kindOf[idx] = "内容"
                 continue
             }
-            jobs.append((idx, r.itemProvider, pick.id, pick.isVideo))
+            jobs.append((idx, r.itemProvider, pick.id, pick.isVideo, r.assetIdentifier))
             kindOf[idx] = pick.isVideo ? "视频" : "照片"
         }
 
@@ -836,7 +935,8 @@ final class Engine: ObservableObject {
                 await withTaskGroup(of: (Int, URL?, String).self) { group in
                     for j in batch {
                         group.addTask {
-                            let (u, why) = await Engine.loadOne(j.provider, typeID: j.typeID, isVideo: j.isVideo)
+                            let (u, why) = await Engine.loadOne(j.provider, typeID: j.typeID,
+                                                               isVideo: j.isVideo, assetID: j.assetID)
                             return (j.idx, u, why)
                         }
                     }
@@ -854,7 +954,7 @@ final class Engine: ObservableObject {
             let ok = slots.compactMap { $0 }
             let failedList: [String] = errs.keys.sorted().map { idx in
                 let why = errs[idx] ?? "未知原因"
-                let short = why.count > 70 ? String(why.prefix(70)) + "…" : why
+                let short = why.count > 220 ? String(why.prefix(220)) + "…" : why
                 return "第 \(idx + 1) 项\(kindOf[idx] ?? "内容")（\(short)）"
             }
 
@@ -1440,7 +1540,11 @@ struct PhotoPicker: UIViewControllerRepresentable {
     let onPick: ([PHPickerResult]) -> Void
     func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
     func makeUIViewController(context: Context) -> PHPickerViewController {
-        var cfg = PHPickerConfiguration(); cfg.selectionLimit = 0; cfg.filter = .any(of: [.images, .videos])
+        // ★ 用 photoLibrary 初始化：这样 PHPickerResult.assetIdentifier 才有值，
+        //   最后兜底（无读权限时用不到的相册原始资源路径）才有 id 可用。
+        //   PHPicker 本身不需要相册权限，这里也不会多弹任何授权框。
+        var cfg = PHPickerConfiguration(photoLibrary: .shared())
+        cfg.selectionLimit = 0; cfg.filter = .any(of: [.images, .videos])
         // ★ preferredAssetRepresentationMode = .current：不强制转码，直接用原始文件，
         //   视频能秒取（旧默认 .automatic 会对部分片子走转码，慢且易中途失败）
         cfg.preferredAssetRepresentationMode = .current
