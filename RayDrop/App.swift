@@ -895,6 +895,129 @@ final class Engine: ObservableObject {
         }
     }
 
+    // MARK: - ★ v44 自建相册选择器：严格按点选顺序导出原始资源
+
+    /// 收录自建选择器选中的 asset。
+    ///
+    /// 与 `preparePhotos` 的两点根本区别：
+    ///  1) **顺序可信**：传入数组就是用户点选的先后（选择器按点击顺序记录），
+    ///     不再受 PHPicker「按相册顺序返回」的影响；
+    ///  2) **取文件方式可靠**：走 `PHAssetResourceManager` 直接写原始资源，
+    ///     不经过 `NSItemProvider`，所以不会再有 `Cannot load representation of type …`、
+    ///     也不会因为「请求了具体编码类型 + 不许转码」而整项失败。
+    ///
+    /// 并发模型与 `preparePhotos` 一致：每批 2 项，批间串行，防止两条大视频同时导出撑爆内存。
+    func prepareAssets(_ assets: [PHAsset], done: @escaping () -> Void) {
+        guard !assets.isEmpty else { done(); return }
+        let total = assets.count
+        preparing = true
+        status = "正在读取 \(total) 项…"
+
+        let snapshot = assets
+        Task.detached(priority: .userInitiated) {
+            var slots: [URL?] = Array(repeating: nil, count: total)
+            var errs: [Int: String] = [:]
+            var kindOf: [Int: String] = [:]
+            for (i, a) in snapshot.enumerated() {
+                kindOf[i] = a.mediaType == .video ? "视频" : "照片"
+            }
+            var finished = 0
+            var i = 0
+            while i < total {
+                let end = min(i + 2, total)
+                await withTaskGroup(of: (Int, URL?, String).self) { group in
+                    for idx in i..<end {
+                        let a = snapshot[idx]
+                        group.addTask {
+                            let (u, why) = await Engine.exportAsset(a)
+                            return (idx, u, why)
+                        }
+                    }
+                    for await r in group {
+                        slots[r.0] = r.1
+                        if r.1 == nil { errs[r.0] = r.2.isEmpty ? "未知原因" : r.2 }
+                        finished += 1
+                        let f = finished
+                        DispatchQueue.main.async { self.status = "正在读取 \(f)/\(total) 项…" }
+                    }
+                }
+                i = end
+            }
+
+            let ok = slots.compactMap { $0 }
+            let failedList: [String] = errs.keys.sorted().map { idx in
+                let why = errs[idx] ?? "未知原因"
+                let short = why.count > 220 ? String(why.prefix(220)) + "…" : why
+                return "第 \(idx + 1) 项\(kindOf[idx] ?? "内容")（\(short)）"
+            }
+
+            DispatchQueue.main.async {
+                self.preparing = false
+                if ok.isEmpty {
+                    self.pendingItems = []
+                    self.pendingSummary = ""
+                    self.status = failedList.isEmpty ? "没有选中任何内容" : "读取失败，未加入待发"
+                    if !failedList.isEmpty { self.addLog("以下内容读取失败：\(failedList.joined(separator: "、"))") }
+                } else {
+                    self.pendingItems = ok.map { .file($0) }
+                    self.pendingSummary = "已选 \(ok.count) 项"
+                    if failedList.isEmpty {
+                        self.status = "已选 \(ok.count) 项，点下方设备发送"
+                    } else {
+                        self.status = "已选 \(ok.count) 项，另有 \(failedList.count) 项读取失败"
+                        self.addLog("有 \(failedList.count) 项未能加入待发：\(failedList.joined(separator: "；"))")
+                    }
+                }
+                done()
+            }
+        }
+    }
+
+    /// 从 PHAsset 导出**原始文件**到沙盒，一个字节都不转。
+    ///
+    /// 资源挑选顺序：当前版本（.photo / .video，所见即所得）
+    ///   → 原始版本（.fullSizePhoto / .fullSizeVideo，编辑前）
+    ///   → 兜底取第一个。
+    /// `isNetworkAccessAllowed = true`：iCloud 里只有缩略图的资源会自动下载原文件。
+    static func exportAsset(_ asset: PHAsset) async -> (URL?, String) {
+        await withCheckedContinuation { (cont: CheckedContinuation<(URL?, String), Never>) in
+            let once = Once<(URL?, String)>(cont)
+
+            let all = PHAssetResource.assetResources(for: asset)
+            guard !all.isEmpty else {
+                once.fire((nil, "这个资源没有可取的文件")); return
+            }
+            let res = all.first { $0.type == .photo || $0.type == .video }
+                ?? all.first { $0.type == .fullSizePhoto || $0.type == .fullSizeVideo }
+                ?? all[0]
+
+            let raw = res.originalFilename.replacingOccurrences(of: "/", with: "_")
+            let name = raw.isEmpty ? "asset_\(UUID().uuidString.prefix(8))" : raw
+            let dst = Engine.makeTempSlot(for: name)
+
+            let opt = PHAssetResourceRequestOptions()
+            opt.isNetworkAccessAllowed = true
+
+            PHAssetResourceManager.default().writeData(for: res, toFile: dst, options: opt) { err in
+                if let err = err {
+                    once.fire((nil, err.localizedDescription)); return
+                }
+                let sz = ((try? FileManager.default.attributesOfItem(atPath: dst.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                guard sz > 0 else {
+                    try? FileManager.default.removeItem(at: dst)
+                    once.fire((nil, "导出的文件为空")); return
+                }
+                // 名字与真实容器对齐（只改名，不动字节）
+                once.fire((Engine.alignExtension(dst), ""))
+            }
+
+            // 兜底：iCloud 原文件下载卡住时不能无限等
+            DispatchQueue.global().asyncAfter(deadline: .now() + 900) {
+                once.fire((nil, "导出超过 15 分钟未完成（可能是 iCloud 原文件未下载完）"))
+            }
+        }
+    }
+
     /// `done` 在所有项读完后回调（主线程）。providers 由本方法捕获的 `results` 持有，
     /// 与 picker 是否销毁无关 —— 所以调用方可以立即关掉 sheet，加载照常进行。
     ///
@@ -1186,6 +1309,7 @@ final class Engine: ObservableObject {
 struct ContentView: View {
     @StateObject var engine = Engine()
     @State var showPhoto = false
+    @State var showPicker = false
     @State var showDoc = false
     @State var showText = false
     @State var textDraft = ""
@@ -1225,6 +1349,22 @@ struct ContentView: View {
                     .accessibilityLabel("打开文件浏览器")
                 }
             }
+        }
+        // ★ v44：自建全屏选择器（最新在右下、往上拉看更早、编号 = 发送顺序）
+        //   用 fullScreenCover 而不是 sheet：sheet 下拉就会关掉，用户要的是独立整页。
+        .fullScreenCover(isPresented: $showPicker) {
+            AssetPickerView(
+                onCancel: { showPicker = false },
+                onFallback: {
+                    // 没有相册权限 → 退回系统选择器（那个不需要授权）
+                    showPicker = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { showPhoto = true }
+                },
+                onDone: { assets in
+                    showPicker = false
+                    engine.prepareAssets(assets) { }
+                }
+            )
         }
         .sheet(isPresented: $showPhoto) {
             // 关掉 sheet 不影响加载：providers 由 preparePhotos 捕获持有。
@@ -1305,7 +1445,7 @@ struct ContentView: View {
 
     private var kindBar: some View {
         HStack(spacing: 0) {
-            KindButton(icon: "photo", title: "照片", tint: .blue) { showPhoto = true }
+            KindButton(icon: "photo", title: "照片", tint: .blue) { showPicker = true }
             KindButton(icon: "folder", title: "文件", tint: .green) { showDoc = true }
             KindButton(icon: "textformat", title: "文本", tint: .orange) { showText = true }
         }

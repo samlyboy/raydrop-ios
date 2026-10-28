@@ -9,8 +9,8 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>RayDrop</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>43.2</string>
-	<key>CFBundleVersion</key><string>46</string>
+	<key>CFBundleShortVersionString</key><string>44.0</string>
+	<key>CFBundleVersion</key><string>47</string>
 	<key>LSRequiresIPhoneOS</key><true/>
 	<!-- ★ 接收文件全自动落盘到沙盒 Documents/下载，并让该目录在系统「文件」App 里直接可见（我的 iPhone → RayDrop锐传 → 下载），无需手动"存储到文件" -->
 	<key>UIFileSharingEnabled</key><true/>
@@ -20,8 +20,9 @@
 	<!-- ★ v38：必须有这条「读」权限描述。iOS 17 下只要调用任何读相册的接口
 	     （如写后回查 PHAsset）而 Info.plist 缺这个键，系统会直接把 App 杀掉，
 	     表现就是「收完文件就闪退回桌面」。代码里已改成没有读权限就不回查，
-	     这里再补上键做双重保险，避免以后任何一处读接口把 App 弄崩。 -->
-	<key>NSPhotoLibraryUsageDescription</key><string>用于确认接收到的图片/视频已写入相册</string>
+	     这里再补上键做双重保险，避免以后任何一处读接口把 App 弄崩。
+	     ★ v44：自建相册选择器直接读 PhotoKit，这条文案改成对用户说清真实用途。 -->
+	<key>NSPhotoLibraryUsageDescription</key><string>用于显示相册中的照片和视频，供你选择要发送的内容</string>
 	<key>UILaunchScreen</key><dict/>
 	<key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
 	<key>UISupportedInterfaceOrientations</key>
