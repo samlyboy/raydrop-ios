@@ -753,7 +753,7 @@ final class Engine: ObservableObject {
         if FileManager.default.fileExists(atPath: dst.path) { try? FileManager.default.removeItem(at: dst) }
         return await withCheckedContinuation { (cont: CheckedContinuation<(URL?, String), Never>) in
             let once = Once<(URL?, String)>(cont)
-            PHAssetResourceManager.default().writeData(for: res, toFile: dst.path, options: nil) { err in
+            PHAssetResourceManager.default().writeData(for: res, toFile: dst, options: nil) { err in
                 if let err = err { once.fire((nil, err.localizedDescription)) }
                 else { once.fire((dst, "")) }
             }
@@ -926,7 +926,7 @@ final class Engine: ObservableObject {
         Task.detached(priority: .userInitiated) {
             // 拷成局部变量再改：避免在并发闭包里直接改外部 var
             var errs = failedSeed
-            var kindOf = kindSeed
+            let kindOf = kindSeed
             var slots: [URL?] = Array(repeating: nil, count: total)
             var finished = 0
             var i = 0
