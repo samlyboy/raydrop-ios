@@ -181,6 +181,13 @@ final class Engine: ObservableObject {
 
     func start() {
         if didStart { return }; didStart = true
+        // ★ v46：后台空闲自动退出。这里只注入「忙不忙」的判定，计时与退出交给 RDIdleExit。
+        //   三个标记都要算：txActive（正在传）、sendingToID（点下去到握手完成之间，常几秒到十几秒）、
+        //   preparing（选完素材还在导出/复制，此时被杀会白等一场）。
+        RDIdleExit.shared.isBusy = { [weak self] in
+            guard let self else { return false }
+            return self.txActive || self.sendingToID != nil || self.preparing
+        }
         receiver.onStatus = { [weak self] s in
             DispatchQueue.main.async {
                 guard let self else { return }

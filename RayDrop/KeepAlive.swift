@@ -117,6 +117,18 @@ final class RDAppDelegate: NSObject, UIApplicationDelegate
         return true
     }
 
+    /// ★ v46：切到后台开始计时（空闲 2 分钟就结束进程；有传输则一直等着）
+    func applicationDidEnterBackground(_ application: UIApplication)
+    {
+        RDIdleExit.shared.didEnterBackground()
+    }
+
+    /// 回到前台立刻取消计时
+    func applicationWillEnterForeground(_ application: UIApplication)
+    {
+        RDIdleExit.shared.willEnterForeground()
+    }
+
     /// 分享扩展通过 Darwin 通知告知"inbox 里有新文件"；主 APP 在前台或后台都会收到
     private func listenForShare()
     {
@@ -140,3 +152,87 @@ final class RDAppDelegate: NSObject, UIApplicationDelegate
         return true
     }
 }
+
+/// 后台空闲自动退出（v46）
+///
+/// 需求：切到后台时，**没有在传文件**就 2 分钟后结束进程；**正在传**就一直活着。
+///
+/// 为什么不是「进后台立刻退」：这个 App 靠静音音频保活，进后台后进程本来就会一直跑，
+/// 不收文件也不传文件时白占内存、还一直挂着一个后台音频。给个 2 分钟宽限期，是为了
+/// 覆盖「刚切出去马上又切回来」「对端刚好这时候发文件过来」这两种情况。
+///
+/// 判定用轮询而不是监听状态变化：Engine 里 txActive / sendingToID / preparing 三个
+/// 标记会在很多处被改动（开始、结束、中止、失败、超时），逐个挂钩容易漏；每 5 秒问一次
+/// 「现在忙吗」最不容易出错，代价可以忽略。
+final class RDIdleExit
+{
+    static let shared = RDIdleExit()
+
+    /// 由 Engine 注入：是否正在传输 / 连接中 / 正在导出素材
+    var isBusy: () -> Bool = { false }
+
+    /// 后台空闲多久结束进程
+    private let limit: TimeInterval = 120
+    /// 轮询间隔
+    private let tickInterval: TimeInterval = 5
+
+    private var timer: Timer?
+    private var idleSince: Date?
+    private var inBackground = false
+    private var fired = false
+
+    func didEnterBackground()
+    {
+        guard !fired else { return }
+        inBackground = true
+        // 进后台那一刻就在传 → 先不计时；等它传完再由 evaluate 起算
+        idleSince = isBusy() ? nil : Date()
+        startTicking()
+    }
+
+    func willEnterForeground()
+    {
+        inBackground = false
+        idleSince = nil
+        stopTicking()
+    }
+
+    private func startTicking()
+    {
+        stopTicking()
+        let t = Timer.scheduledTimer(withTimeInterval: tickInterval, repeats: true) { [weak self] _ in
+            self?.evaluate()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func stopTicking()
+    {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func evaluate()
+    {
+        guard inBackground, !fired else { return }
+        if isBusy() {
+            // 又忙起来了：清空起点，等这次传完重新计 2 分钟
+            idleSince = nil
+            return
+        }
+        if idleSince == nil { idleSince = Date() }
+        guard let since = idleSince, Date().timeIntervalSince(since) >= limit else { return }
+        shutdown()
+    }
+
+    private func shutdown()
+    {
+        fired = true
+        stopTicking()
+        RDKeepAlive.shared.stop()          // 先把静音音频停掉，别让系统音频会话悬着
+        UserDefaults.standard.synchronize() // 退出前落盘，防止刚改的名字/编号丢失
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
+    }
+}
+
