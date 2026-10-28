@@ -179,16 +179,20 @@ final class Engine: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.status = s
-                // ★ v40：监听起不来时，把**真实原因**也写进日志（不是只说"正在重建"）。
-                //   去重由 RDReceiver 侧保证（同一句只报一次），不会刷屏。
-                if s.hasPrefix("接收服务等待中") || s.hasPrefix("接收服务失败") || s.hasPrefix("接收端口错误") {
+                // ★ v42：只有「失败 / 等待网络 / 创建失败」这类真问题才写日志；
+                //   「接收服务已开启」由 onListening 那条带端口的日志代表，不重复。
+                if s.hasPrefix("接收服务失败") || s.hasPrefix("接收服务等待")
+                    || s.hasPrefix("接收服务创建失败") {
                     self.addLog(s)
                 }
             }
         }
+        // ★ v42：接收端口由系统动态分配，公告里带的是**当前真实端口**。
+        //   这一条把「固定 41235 → EADDRINUSE → 反复重建」的死循环从根上拆掉。
+        discovery.portProvider = { [weak self] in self?.receiver.listeningPort ?? 0 }
         // ★ 监听就绪（含被系统挂起后的自动重建）→ 立刻公告一轮，让对端马上刷新本机在线状态
         //   回调来自监听的串行队列，转回主线程再动 UI 状态
-        receiver.onListening = { [weak self] in DispatchQueue.main.async { self?.onReceiverReady() } }
+        receiver.onListening = { [weak self] p in DispatchQueue.main.async { self?.onReceiverReady(p) } }
         // ★ 收到文件已经自动落盘到「下载」（无需手动确认），这里只更新界面记录
         receiver.onSaved = { [weak self] from, name, path in
             DispatchQueue.main.async {
@@ -226,7 +230,13 @@ final class Engine: ObservableObject {
         }
         sender.onStart = { [weak self] peer, total in self?.beginTx(up: true, peer: peer, total: total) }
         sender.onProgress = { [weak self] cur, total, done, size, bps in self?.updateTx(cur: cur, total: total, done: done, size: size, bps: bps) }
-        sender.onEnd = { [weak self] ok, msg in self?.endTx(ok: ok, msg: msg) }
+        sender.onEnd = { [weak self] ok, msg in
+            // 记下失败原因：beginSend 据此判断「端口过期」要不要自动重试一次
+            DispatchQueue.main.async {
+                self?.lastSendReason = msg
+                self?.endTx(ok: ok, msg: msg)
+            }
+        }
         addLog("接收到的文件会自动存入「下载」文件夹（文件 App → 我的 iPhone → RayDrop锐传 → 下载），无需手动确认；图片/视频另存一份到相册。")
         receiver.start(); discovery.start()
         // ★ 1s 一轮巡检：通道断开（LAN 10s / TS 20s）与整机离线都能在 1s 内反映到界面；
@@ -251,7 +261,9 @@ final class Engine: ObservableObject {
         let name = o["name"] as? String ?? "设备"
         let platform = o["platform"] as? String ?? ""
         let ips = o["ips"] as? [String] ?? []
-        let port = UInt16((o["port"] as? NSNumber)?.intValue ?? Int(RD.tcpPort))
+        // ★ v42：端口由对端动态分配后公告过来。0 = 对方接收服务还没起来（刚启动/刚回前台重建），
+        //   此时**保留上一次已知端口**（大概率仍然有效），而不是把它清成 0 让设备变成点不动。
+        let port = UInt16((o["port"] as? NSNumber)?.intValue ?? 0)
 
         let myIPs = RDIP.ips()
         let src = o["srcIP"] as? String ?? ""
@@ -305,7 +317,8 @@ final class Engine: ObservableObject {
             let wasAlive = lanAlive(devices[i]) || tsAlive(devices[i])
             devices[i].id = id.hasPrefix("cf:") ? devices[i].id : id
             devices[i].code = code; devices[i].name = name; devices[i].platform = platform
-            devices[i].port = port; devices[i].lastSeen = now
+            if port > 0 { devices[i].port = port }   // 0 = 对方尚未分配端口，保留旧值
+            devices[i].lastSeen = now
             if viaLan { devices[i].lanHost = src; devices[i].lanSeen = now }
             if viaTs  { devices[i].tsHost  = src; devices[i].tsSeen  = now }
             if viaLan && !viaTs && peerTSAdvertised.isEmpty && now.timeIntervalSince(devices[i].tsSeen) > 3 {
@@ -373,23 +386,23 @@ final class Engine: ObservableObject {
 
     /// 监听掉线起始时刻（nil = 正常）。只用来把「一直在重建」压成一条状态，不再每 5s 刷屏。
     private var listenDownAt: Date?
+    /// 上一次上报过的监听端口：只用于「首次就绪 / 端口变了」时写一条日志
+    private var lastListenPort: UInt16 = 0
+    /// 最近一次发送结束的原因（"连接失败"/"连接 xx 超时"/"发送完成"…），用于判断是否值得自动重试
+    private var lastSendReason = ""
 
-    /// ★ 监听不在 ready 就重建（带宽限与退避，见 RDReceiver.ensureListening）。
-    ///   根因：iOS 把 App 压到后台/被抢占时 NWListener 会掉到 waiting/failed，套接字失效 →
-    ///   对端 TCP 连接被 RST（ECONNREFUSED），而 UDP 心跳仍在 → 「显示在线却发不进来」。
-    ///   v37：只在「掉线→重建」和「恢复」两个瞬间各写一条日志。旧实现每次巡检成功重建都写一条，
-    ///   而重建本身又因为误判 waiting 而每 5s 发生一次，于是日志被同一句话刷满。
+    /// ★ v42：监听不在 ready 就重建。
+    ///   动态端口下这是**零成本**操作（新 listener 直接拿一个新端口，绝不会撞 EADDRINUSE），
+    ///   所以不再需要旧版的延迟重绑 / A-B 参数轮换 / 8s 启动看门狗 / 20s 宽限 / 指数退避。
     func ensureReceiverUp() {
         guard appActive else { return }
-        guard receiver.ensureListening() else { return }
-        discovery.announceAll()
-        let now = Date()
+        if receiver.isListening { return }
+        receiver.ensureUp()
         if listenDownAt == nil {
-            listenDownAt = now
+            listenDownAt = Date()
             addLog("接收服务未就绪，正在重建…")
-        } else if let t = listenDownAt, now.timeIntervalSince(t) > 180 {
-            // 长时间修不好：每 3 分钟只提醒一次，不刷屏
-            listenDownAt = now
+        } else if let t = listenDownAt, Date().timeIntervalSince(t) > 180 {
+            listenDownAt = Date()
             addLog("接收服务持续未就绪，仍在后台重试")
         }
     }
@@ -397,7 +410,7 @@ final class Engine: ObservableObject {
     /// 回到前台时调用：确认监听可用 + 立刻公告一轮 + 重查 tailnet 目标
     func onForeground() {
         appActive = true
-        // 前台是「马上就要能收」的时刻：不在 ready 就立刻重建一次（内部限速 3s）
+        // 前台是「马上就要能收」的时刻：不在 ready 就立刻重建（动态端口，无成本）
         receiver.rebuildIfNeededNow()
         // ★ v36：回到前台时**重建 UDP 接收 socket**。换 Wi-Fi / 休眠唤醒后，老 socket
         //   可能一个包都收不到（对端却一切正常）→ 表现为"设备明明在线却看不到"。
@@ -405,12 +418,16 @@ final class Engine: ObservableObject {
         refreshTailscale()
     }
 
-    /// 监听就绪（含重建成功）→ 立刻公告，让对端第一时间刷新本机在线状态
-    private func onReceiverReady() {
+    /// 监听就绪（含重建成功）→ 立刻公告，让对端第一时间刷新本机在线状态与端口
+    private func onReceiverReady(_ port: UInt16) {
         if listenDownAt != nil {
             listenDownAt = nil
-            addLog("接收服务已恢复")
+            addLog("接收服务已恢复（端口 \(port)）")
+        } else if lastListenPort != port {
+            // 首次启动或端口变了（重建）→ 写一条，方便排查"对方连不上"时确认端口
+            addLog("接收服务已就绪（端口 \(port)）")
         }
+        lastListenPort = port
         discovery.announceAll()
     }
 
@@ -722,6 +739,12 @@ final class Engine: ObservableObject {
             addLog("所选内容还在读取（大视频导出较慢），顶部显示「已选 N 项」后再点设备")
             return
         }
+        // ★ v42：端口 0 = 对方接收服务还没起来（刚启动 / 刚回前台重建）
+        guard dev.port != 0 else {
+            status = "\(dev.name) 的接收服务还没就绪，请稍等再试"
+            addLog("\(dev.name) 尚未上报接收端口，等它公告后（约 2 秒）再点")
+            return
+        }
         guard !pendingItems.isEmpty else {
             status = "请先在顶部选择要发送的内容（照片/文件/文本）"
             addLog("还没有待发内容：先点「照片 / 文件 / 文本」选好，再点设备")
@@ -741,16 +764,37 @@ final class Engine: ObservableObject {
     }
 
     /// 统一的「点设备 → 发送」入口：**立刻**给出连接中反馈 + 锁设备行 + 防重入。
-    /// sendPending / sendShared 共用，避免两条路径各写一套反馈。
     private func beginSend(to dev: DeviceInfo, host: String, items: [SendItem], done: @escaping (Bool) -> Void) {
+        startSend(to: dev, host: host, items: items, retryLeft: 1, done: done)
+    }
+
+    /// ★ v42：允许**自动重试一次**。端口是动态的，对端刚从后台回来重建过监听时，
+    ///   我们手上的端口就是旧的 → TCP 直接 RST。这种失败重试一次（并请求对端重播公告）就能成，
+    ///   不该让用户自己去猜"是不是没点上"。
+    private func startSend(to dev: DeviceInfo, host: String, items: [SendItem],
+                           retryLeft: Int, done: @escaping (Bool) -> Void) {
         sendingToID = dev.id
         txActive = true; txUp = true; txTotal = items.count; paused = false
         status = "正在连接 \(dev.name)…"
         progress = "连接中…"
-        addLog("准备发送 \(items.count) 项 → \(dev.name)（\(host)），正在连接…")
+        addLog("准备发送 \(items.count) 项 → \(dev.name)（\(host):\(dev.port)），正在连接…")
         sender.send(host: host, port: dev.port, peerName: dev.name, items: items) { ok in
             DispatchQueue.main.async {
                 self.sendingToID = nil
+                let why = self.lastSendReason
+                let portStale = why.contains("连接失败") || why.contains("超时（")
+                if !ok && retryLeft > 0 && portStale {
+                    // 让对端立刻重播一轮公告（把最新端口带回来），1 秒后用新端口再试
+                    self.discovery.reply(to: host)
+                    self.status = "连接失败，正在用最新端口重试…"
+                    self.addLog("连接 \(dev.name) 失败（\(why)），1 秒后用最新端口自动重试")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        let fresh = self.devices.first { $0.id == dev.id } ?? dev
+                        self.startSend(to: fresh, host: host, items: items,
+                                       retryLeft: retryLeft - 1, done: done)
+                    }
+                    return
+                }
                 done(ok)
             }
         }

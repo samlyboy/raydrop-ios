@@ -160,6 +160,10 @@ final class RDDiscovery {
     /// 上层提供的额外单播目标（发现的设备 IP、CF 目录查到的 IP）
     private var extra: [String] = []
     var onDevice: ([String: Any]) -> Void = { _ in }
+    /// ★ v42：本机接收服务的**当前实际端口**（由 RDReceiver 动态分配）。
+    ///   旧实现公告里写死 RD.tcpPort，于是接收端只能死守 41235 —— 那是 EADDRINUSE 与
+    ///   「反复重建」的总根源。现在端口由系统分配，每轮公告把真实端口带出去。
+    var portProvider: () -> UInt16 = { 0 }
 
     func setExtraTargets(_ ips: [String]) { lock.lock(); extra = ips; lock.unlock() }
 
@@ -191,7 +195,7 @@ final class RDDiscovery {
             "app": RD.app, "v": 2, "name": RDStore.shared.myName,
             "code": RDStore.shared.myCode, "did": RDStore.shared.deviceId,
             "platform": "iOS",
-            "port": Int(RD.tcpPort), "ips": RDIP.ips()
+            "port": Int(portProvider()), "ips": RDIP.ips()
         ]
         return try? JSONSerialization.data(withJSONObject: me)
     }
@@ -399,173 +403,133 @@ final class RDDiscovery {
     }
 }
 
-/// TCP 接收端：握手 → 逐文件收 → **全自动落盘到「下载」文件夹** → 图片/视频再另存一份相册 → ACK（单线程保序）
-/// 收到即存，**无需任何手动确认**（不再弹"存储到文件"）。只有写「下载」失败才回 err；
-/// 相册保存失败仅提示、不中断传输——因为文件已经实实在在落在「下载」里了。
+/// TCP 接收端（v42 重写）：**端口交给系统动态分配** + 单会话串行。
+///
+/// 旧实现把监听端口固定成 41235，随之而来的是一整串无法根治的问题：
+/// `cancel()` 只是"请求关闭"，内核要到下一轮事件循环才真正释放端口，于是立刻重绑必撞
+/// EADDRINUSE(POSIX 48) → NWListener 停在 .waiting → 巡检看到非 ready 又重建 → 再撞一次。
+/// 为了绕过它，代码里陆续加了延迟 0.35s 重绑、A/B 两档参数轮换、0.8s 快重试、8s 启动看门狗、
+/// 20s 宽限、20→300s 指数退避…… 近 400 行全在跟"自己跟自己抢端口"搏斗，
+/// 而用户看到的就是「一直启动中」「反复重建」「接收服务已自动重连」刷屏。
+///
+/// v42 改为 `NWListener(using:)` **不指定端口**，由系统分配；ready 后取 `listener.port`
+/// 通过 UDP 公告带给对端，对端连这个端口。于是：
+///   · 永远不会 EADDRINUSE，重建只是一次新建，毫秒级，不需要任何退避/轮换/看门狗；
+///   · 后台被系统挂起 → 回前台重建 → 端口变了 → 立刻公告，对端一个公告周期（2s）内跟上；
+///   · 状态只剩「port / busy / current」三个。
 final class RDReceiver {
     var onStatus: (String) -> Void = { _ in }
     var onSaved: (String, String, String) -> Void = { _, _, _ in }       // 对端名, 文件名, 落盘路径(「下载」目录内)
     var onStart: (String, Int) -> Void = { _, _ in }                    // 对端名, 文件总数
-    var onProgress: (Int, Int, Int64, Int64, Double) -> Void = { _, _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 文件总大小, 字节/秒
+    var onProgress: (Int, Int, Int64, Int64, Double) -> Void = { _, _, _, _, _ in }
     var onEnd: (Bool, String) -> Void = { _, _ in }
-    /// 有媒体文件已落「下载」但没进相册时回调（参数为汇总说明），供上层写日志提醒
     var onAlbumNote: (String) -> Void = { _ in }
-    var onText: (String, String) -> Void = { _, _ in }                       // 收到文本消息(来自, 文本)
+    var onText: (String, String) -> Void = { _, _ in }
+    /// 监听就绪（含每次重建）→ 参数是**本次实际端口**，上层据此立刻公告给对端
+    var onListening: (UInt16) -> Void = { _ in }
+
+    private let lq = DispatchQueue(label: "raydrop.listener")
     private var listener: NWListener?
+    private var port: UInt16 = 0
+    /// 同一时刻只服务一个传输会话（并发会让两批数据往「下载」写同名文件互相覆盖）
+    private var busy = false
     private var current: RDStream?
-    private var aborted = false;   // 用户点「终止」→ 与意外中断区分提示
-    /// ★ 监听状态必须串行化：state handler 在后台队列回调，巡检在主线程调用。
-    ///   旧实现两边各自读写 `isListening` 这个裸 Bool，既有数据竞争，又无法做「宽限 / 退避」——
-    ///   于是每 5s 见到非 ready 就推倒重建一次，日志被「已自动重建」刷屏（见 v37 修复）。
-    let lq = DispatchQueue(label: "raydrop.listener")
-    private var ready = false                 // 仅在 lq 上读写
-    private var lastRebuildAt = Date.distantPast
-    private var rebuildAttempts = 0
-    /// 上一轮建监听用的参数形态（见 makeListener 的两档），下次重建换另一档试
-    private var bindStyle = 0
-    /// 已在排队等重建（避免重复排队）
-    private var rebindPending = false
-    /// 端口被占（TIME_WAIT）触发的快速重试次数
-    private var fastRetry = 0
-    /// 上一次报给界面的等待原因，避免重复刷同一条
-    private var lastWaitNote = ""
-    /// 监听是否就绪（线程安全读）
-    var isListening: Bool { lq.sync { ready } }
-    /// 监听就绪（含重建成功）后回调：让上层立刻重新公告，对端随即刷新本机在线状态
-    var onListening: () -> Void = { }
+    private var aborted = false
 
-    func start() {
-        aborted = false
-        lq.sync { beginListeningLocked() }
-    }
+    /// 当前监听端口（0 = 未就绪）。线程安全。
+    var listeningPort: UInt16 { lq.sync { port } }
+    /// 监听是否就绪（线程安全）
+    var isListening: Bool { lq.sync { port != 0 } }
 
-    /// 建立（或重建）监听。**只允许在 lq 上调用**。
-    /// ★ v40：先 cancel 旧监听，**延迟 0.35s 再 bind**。
-    ///   `cancel()` 只是"请求关闭"，内核 socket 要到下一轮事件循环才真正释放。
-    ///   旧实现 cancel 后立刻在同一端口新建，iOS 15 上直接撞 `EADDRINUSE(POSIX 48)` →
-    ///   新监听停在 `.waiting` → 巡检 20s 后又重建 → 又是一次同样的相撞，于是永远起不来。
-    ///   iOS 17 释放得更快，所以同样的代码只有老系统出事。
-    private func beginListeningLocked() {
-        lastRebuildAt = Date()
-        ready = false
-        if listener != nil {
-            listener?.stateUpdateHandler = nil
-            listener?.cancel()
-            listener = nil
-            scheduleRebindLocked(after: 0.35)
-        } else {
-            createListenerLocked()
-        }
-    }
+    func start() { lq.async { self.buildLocked() } }
 
-    /// 排一次延迟重建（同一时刻只排一个）
-    private func scheduleRebindLocked(after delay: TimeInterval) {
-        guard !rebindPending else { return }
-        rebindPending = true
-        lq.asyncAfter(deadline: .now() + delay) { [weak self] in
+    /// 不在 ready 就重建。动态端口下重建极便宜，不需要任何退避。
+    func ensureUp() {
+        lq.async { [weak self] in
             guard let self else { return }
-            self.rebindPending = false
-            if self.listenerReady { return }
-            self.createListenerLocked()
+            if let l = self.listener, case .ready = l.state, self.port != 0 { return }
+            self.buildLocked()
         }
     }
+    /// 兼容旧调用名
+    func rebuildIfNeededNow() { ensureUp() }
 
-    /// 真正创建监听。**只允许在 lq 上调用**。
-    private func createListenerLocked() {
-        ready = false
-        lastRebuildAt = Date()
+    func pause() { current?.setPaused(true) }
+    func resume() { current?.setPaused(false) }
+    func abort() { aborted = true; current?.close(); current = nil }
+
+    /// 建立监听。**只允许在 lq 上调用**。
+    private func buildLocked() {
+        if let old = listener {
+            old.stateUpdateHandler = nil
+            old.cancel()
+            listener = nil
+        }
+        port = 0
         do {
-            let l = try makeListener()
-            l.newConnectionHandler = { (conn: NWConnection) in
-                conn.start(queue: DispatchQueue.global())
-                let stream = RDStream(conn)
-                self.current = stream
-                Task { await self.handle(stream) }
-            }
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.allowLocalEndpointReuse = true
+            let l = try NWListener(using: params)          // ★ 不指定端口：由系统分配
+            l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
             l.stateUpdateHandler = { [weak self] st in
                 guard let self else { return }
                 self.lq.async {
+                    guard self.listener === l else { return }   // 已被新一轮替换，别乱动
                     switch st {
                     case .ready:
-                        self.ready = true
-                        self.rebuildAttempts = 0
-                        self.fastRetry = 0
-                        self.lastWaitNote = ""
-                        self.onStatus("接收服务已开启")
-                        // 就绪即公告一轮（含首次启动与每次重建）：让对端立刻刷新本机在线状态。
-                        // 是否写日志由上层判断（只在「掉线→恢复」时写一条），这里不产生噪音。
-                        self.onListening()
-                    case .failed(let err):
-                        // failed 是终态，NWListener 不会自行恢复 → 允许下一轮巡检立刻重建
-                        self.ready = false
-                        self.lastRebuildAt = .distantPast
-                        self.noteListenProblem(err, tag: "失败")
-                        self.scheduleRebindLocked(after: 1.0)
-                    case .waiting(let err):
-                        // waiting 多数情况可自愈（换网、休眠唤醒），先交给系统；
-                        // 但「端口被占」自愈不了 —— 旧 socket 还压着 41235，必须换参数/稍后重试。
-                        self.ready = false
-                        self.noteListenProblem(err, tag: "等待中")
-                        if Self.isAddrInUse(err), self.fastRetry < 40 {
-                            // 端口被占（多为上一次传输残留的 TIME_WAIT，Darwin 上约 15s）：
-                            // 0.8s 一轮快速重试，最多约 32s，期间 A/B 参数轮换 —— 覆盖整个 TIME_WAIT 窗口。
-                            // 旧实现没有这条：撞上就只能等 20s 巡检，用户看到的就是「一直启动中」。
-                            self.fastRetry += 1
-                            self.bindStyle = 1 - self.bindStyle      // 换一档参数再试
-                            self.scheduleRebindLocked(after: 0.8)
+                        let p = l.port?.rawValue ?? 0
+                        if p != 0 {
+                            self.port = p
+                            self.onStatus("接收服务已开启")
+                            self.onListening(p)
+                        } else {
+                            // 极个别情况取不到端口 → 半秒后重建
+                            self.lq.asyncAfter(deadline: .now() + 0.5) { self.buildLocked() }
                         }
-                    case .cancelled:
-                        self.ready = false
+                    case .failed(let e):
+                        self.port = 0
+                        self.onStatus("接收服务失败：\(RDReceiver.describe(e))")
+                        self.lq.asyncAfter(deadline: .now() + 1.5) { self.buildLocked() }
+                    case .waiting(let e):
+                        // 动态端口下 waiting 只可能是网络还没就绪（如刚换 Wi-Fi），等系统自愈
+                        self.port = 0
+                        self.onStatus("接收服务等待网络：\(RDReceiver.describe(e))")
                     default:
                         break
                     }
                 }
             }
-            l.start(queue: DispatchQueue.global())
             listener = l
-            // ★ v40 启动看门狗：8s 还没 ready，且**连 `.waiting` 都没进过**（一直停在 .setup），
-            //   说明这一档参数在这个系统上压根没起来（iOS 15 上出现过：状态栏永远「启动中…」，
-            //   既不报错也不 ready）。此时换另一档参数重建，比干等 20s 巡检更有效。
-            lq.asyncAfter(deadline: .now() + 8) { [weak self] in
-                guard let self else { return }
-                guard self.listener === l else { return }      // 已经被替换过，别乱动
-                if self.listenerReady { return }
-                if case .waiting = l.state { return }          // 已在等系统自愈，原因已上报界面
-                self.bindStyle = 1 - self.bindStyle
-                self.beginListeningLocked()
-            }
+            l.start(queue: DispatchQueue.global())
         } catch {
-            onStatus("接收端口错误: \(error.localizedDescription)")
-            noteListenProblem(error, tag: "创建失败")
-            scheduleRebindLocked(after: 2.0)
+            port = 0
+            onStatus("接收服务创建失败：\(error.localizedDescription)")
+            lq.asyncAfter(deadline: .now() + 2) { self.buildLocked() }
         }
     }
 
-    /// 两档监听参数，轮流尝试：
-    ///   ⓪ 自定义 TCP 选项 + 允许复用端口（正常路径，重启后端口上有 TIME_WAIT 也能立刻绑上）
-    ///   ① 系统默认 `.tcp`（最朴素）。个别老系统对自定义 `NWParameters` + 复用端口的组合
-    ///      会一直停在 `.setup/.waiting`，这一档是保底。
-    private func makeListener() throws -> NWListener {
-        let port = NWEndpoint.Port(rawValue: RD.tcpPort)!
-        if bindStyle == 0 {
-            let tcpOpts = NWProtocolTCP.Options()
-            tcpOpts.noDelay = true                     // 小文件/握手包别等 Nagle 攒包
-            let params = NWParameters(tls: nil, tcp: tcpOpts)
-            params.allowLocalEndpointReuse = true
-            return try NWListener(using: params, on: port)
-        } else {
-            return try NWListener(using: .tcp, on: port)
+    /// 接受连接：**单会话**。传输进行中的第二个连接直接关掉。
+    private func accept(_ conn: NWConnection) {
+        lq.async { [weak self] in
+            guard let self else { conn.cancel(); return }
+            if self.busy { conn.cancel(); return }
+            self.busy = true
+            self.aborted = false
+            conn.start(queue: DispatchQueue.global())
+            // 45s：两个数据块之间最长容忍间隔。对端把大视频写相册时它在等 ACK，不读 socket，
+            // 但那是**发送端**的 600s 计时；接收端只在真等数据时计时，45s 足够跨过 Wi-Fi 抖动。
+            let s = RDStream(conn, stallTimeout: 45)
+            self.current = s
+            Task {
+                await self.handle(s)
+                self.lq.async {
+                    if self.current === s { self.current = nil }
+                    self.busy = false
+                }
+            }
         }
-    }
-
-    /// 把真实原因报到界面（同一句只报一次），并写进日志供排查。
-    ///   旧实现把 `.waiting` / `.failed` 的 `NWError` 直接扔掉 → 界面永远停在「启动中…」，
-    ///   用户只知道"没起来"，看不到是端口被占、权限不足还是网络没就绪。
-    private func noteListenProblem(_ err: Error, tag: String) {
-        let text = "接收服务\(tag)：\(Self.describe(err))"
-        guard text != lastWaitNote else { return }
-        lastWaitNote = text
-        onStatus(text)
     }
 
     /// NWError 的可读描述（POSIX 码比系统那句 "The operation couldn't be completed" 有用得多）
@@ -573,7 +537,6 @@ final class RDReceiver {
         if let nw = err as? NWError {
             switch nw {
             case .posix(let code):
-                // POSIXErrorCode 只有数字码，配 strerror 才能变成「Address already in use」这种可读原因
                 return "POSIX \(code.rawValue) \(String(cString: strerror(code.rawValue)))"
             case .dns(let code):
                 return "DNS \(code)"
@@ -586,81 +549,19 @@ final class RDReceiver {
         return err.localizedDescription
     }
 
-    /// 端口被占用（EADDRINUSE = 48）
-    private static func isAddrInUse(_ err: Error) -> Bool {
-        if let nw = err as? NWError, case .posix(let code) = nw { return code == .EADDRINUSE }
-        return false
-    }
-
-    /// 监听当前是否真的 ready（以 NWListener.state 为权威值，仅在 lq 上调用）。
-    /// 不用 `==` 比较：NWListener.State 带关联值，用模式匹配最稳。
-    private var listenerReady: Bool {
-        guard let l = listener else { return false }
-        if case .ready = l.state { return true }
-        return false
-    }
-
-    /// 回到前台时调用：不在 ready 就立刻重建一次（前台重建不算失败重试，重置退避）。
-    /// 后台挂起后监听常停在 waiting，靠系统自愈可能要等十几秒；前台是「马上就要能收」的时刻，
-    /// 所以这里主动重建一次。但限速 3s，避免 scenePhase 短时间抖动导致连续重建。
-    func rebuildIfNeededNow() {
-        lq.sync {
-            if listenerReady { ready = true; return }
-            if rebindPending { return }
-            if Date().timeIntervalSince(lastRebuildAt) < 3 { return }
-            // 回前台时也换一档参数：连续起不来时，A/B 轮换比死磕同一档更有机会成功
-            bindStyle = 1 - bindStyle
-            beginListeningLocked()
-            rebuildAttempts = 0
-        }
-    }
-
-    /// ★ 巡检自愈。返回 true 表示本次确实重建了一次监听。
-    ///   修 v36 的两个错误：
-    ///   ① `waiting` 被当成失效 → 立刻重建。但 waiting 是系统会自动恢复的状态，
-    ///      重建反而把正在恢复的监听打断，于是永远卡在 waiting、每 5s 重建一次。
-    ///   ② 没有退避。连续重建失败会以 5s 频率无限重试，白耗电还把日志刷满。
-    ///   现在：waiting 先给 20s 自愈宽限；真正重建按 20→40→80→160s 递增退避，最长 5 分钟一次。
-    @discardableResult
-    func ensureListening() -> Bool {
-        var did = false
-        lq.sync {
-            // ★ 以 NWListener.state 为准（它是权威值），避免回调丢失 / 读写竞争导致「明明 ready 却判定不就绪」，
-            //   否则就会每 5s 把正常工作的监听推倒重建一次。
-            if listenerReady { ready = true; return }
-            if ready { return }
-            // 已排了延迟重建 → 等它执行，别在这里再插一次（否则两个监听抢同一端口）
-            if rebindPending { return }
-            let now = Date()
-            let sinceRebuild = now.timeIntervalSince(lastRebuildAt)
-            // 刚建的监听还在建立 / 等系统恢复：给 20s 宽限，别推倒重来
-            if sinceRebuild < 20 { return }
-            // 连续重建失败 → 指数退避，最多 5 分钟一次，避免空转耗电
-            let cap = min(300.0, 20.0 * pow(2.0, Double(max(0, rebuildAttempts - 1))))
-            if rebuildAttempts > 0 && sinceRebuild < cap { return }
-            // 巡检这一轮也换一档参数，A/B 轮换能绕开「某档在老系统上起不来」
-            bindStyle = 1 - bindStyle
-            beginListeningLocked()
-            rebuildAttempts += 1
-            did = true
-        }
-        return did
-    }
-
-    func pause() { current?.setPaused(true) }
-    func resume() { current?.setPaused(false) }
-    func abort() { aborted = true; current?.close(); current = nil }
-
     private func handle(_ s: RDStream) async {
         var total = 0
         var saveFailed = false
         /// 已落「下载」但写相册失败的媒体文件（视频居多）；结束时汇总报出，避免"以为没收到"
         var albumFailed: [String] = []
-        defer { s.close(); if current === s { current = nil } }
+        defer { s.close() }   // current/busy 的清理统一在 accept 的尾随块里（只在 lq 上改）
         do {
             let hsLine = try await s.readLine()
             guard let hsData = hsLine.data(using: .utf8),
-                  let hs = try? JSONSerialization.jsonObject(with: hsData) as? [String: Any] else { return }
+                  let hs = try? JSONSerialization.jsonObject(with: hsData) as? [String: Any] else {
+                onStatus("收到无法识别的连接，已忽略")
+                return
+            }
             var fromName = hs["name"] as? String ?? "对方"
             if fromName.trimmingCharacters(in: .whitespaces).isEmpty { fromName = "对方" }
             let count = hs["count"] as? Int ?? 0
@@ -761,8 +662,7 @@ final class RDReceiver {
                         onStatus("已存相册：\(name)")
                     } else {
                         // ★ 视频写相册失败是最容易被误认为"没收到"的：文件其实在「下载」里，
-                        //   但用户在相册里找不到。必须把原因连文件名一起报出来，别只说"写入相册失败"。
-                        //   多策略兜底后原因可能较长，日志里截断，完整原因靠第一步的 NSError 即可定位。
+                        //   但用户在相册里找不到。必须把原因连文件名一起报出来。
                         let why = res.1.count > 140 ? String(res.1.prefix(140)) + "…" : res.1
                         albumFailed.append("\(name)（\(why)）")
                         onStatus("已存「下载」，但写入相册失败：\(name)（\(why)）")
@@ -790,7 +690,14 @@ final class RDReceiver {
                 onEnd(false, "接收超时")
                 return
             }
-            onStatus("接收中断"); onEnd(false, "接收中断")
+            // 连接被对端正常关闭（它发完就断了）→ 说清楚是"连接断开"，而不是笼统的"接收中断"
+            if total > 0 {
+                onStatus("接收中断：连接已断开")
+                onEnd(false, "连接已断开")
+            } else {
+                onStatus("连接已断开（未开始传输）")
+                onEnd(false, "连接已断开")
+            }
         }
     }
 }
