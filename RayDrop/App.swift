@@ -126,6 +126,9 @@ final class Engine: ObservableObject {
     private func beginTx(up: Bool, peer: String, total: Int) {
         DispatchQueue.main.async {
             self.txUp = up; self.txTotal = total; self.txActive = true; self.paused = false
+            // ★ v42：传输期间禁止自动锁屏。传 1~2GB 视频要好几分钟，屏幕自动锁定会让 App 挂起、
+            //   socket 被系统回收 —— 表现就是「传到一半突然接收中断」。结束时恢复系统默认。
+            UIApplication.shared.isIdleTimerDisabled = true
             let p = peer.isEmpty ? "对方" : peer
             self.txPeer = p
             self.progress = "(0/\(max(1, total))) " + (up ? "↑上传" : "↓下载") + " 0 KB/s"
@@ -149,6 +152,7 @@ final class Engine: ObservableObject {
     private func endTx(ok: Bool, msg: String) {
         DispatchQueue.main.async {
             self.txActive = false; self.paused = false
+            UIApplication.shared.isIdleTimerDisabled = false   // 恢复系统自动锁屏
             // 发送结束（成功/失败/超时）即解除设备行锁定，允许重试
             if self.txUp { self.sendingToID = nil }
             if ok && self.txTotal > 0 { self.progress = "(\(self.txTotal)/\(self.txTotal)) 完成" }
@@ -163,6 +167,7 @@ final class Engine: ObservableObject {
     func abortTx() {
         if txUp { sender.abort() } else { receiver.abort() }
         txActive = false; paused = false; progress = ""
+        UIApplication.shared.isIdleTimerDisabled = false
         if txUp { sendingToID = nil }   // 终止后立刻解锁设备行，可以马上重试
     }
 

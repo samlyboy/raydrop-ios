@@ -435,6 +435,8 @@ final class RDReceiver {
     private var busy = false
     private var current: RDStream?
     private var aborted = false
+    /// 会话序号：给「30 分钟兜底」用，避免误杀后来的新会话
+    private var sessionSeq = 0
 
     /// 当前监听端口（0 = 未就绪）。线程安全。
     var listeningPort: UInt16 { lq.sync { port } }
@@ -522,11 +524,25 @@ final class RDReceiver {
             // 但那是**发送端**的 600s 计时；接收端只在真等数据时计时，45s 足够跨过 Wi-Fi 抖动。
             let s = RDStream(conn, stallTimeout: 45)
             self.current = s
+            self.sessionSeq += 1
+            let sid = self.sessionSeq
+            // 会话兜底：30 分钟还没收尾就强制释放（相册保存的 completion 万一不回调，
+            // busy 会永久占住 → 之后所有连接都被拒，表现就是「对方一发就被断开」）
+            self.lq.asyncAfter(deadline: .now() + 1800) { [weak self] in
+                guard let self else { return }
+                if self.busy, self.sessionSeq == sid {
+                    self.current?.close()
+                    self.current = nil
+                    self.busy = false
+                    self.onStatus("本次会话超时，已释放接收通道")
+                }
+            }
             Task {
                 await self.handle(s)
                 self.lq.async {
                     if self.current === s { self.current = nil }
-                    self.busy = false
+                    // 只在仍是本会话时才解锁（避免旧会话的尾随块误清掉新会话的 busy）
+                    if self.sessionSeq == sid { self.busy = false }
                 }
             }
         }
