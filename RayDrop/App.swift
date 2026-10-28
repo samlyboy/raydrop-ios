@@ -40,7 +40,7 @@ final class Engine: ObservableObject {
             return p.contains("pc") || p.contains("mac") || p.contains("win") || p.contains("windows") || p.contains("linux")
         }
     }
-    struct LogEntry: Identifiable { let id = UUID(); let text: String; let inColor: Color; let isHeader: Bool }
+    struct LogEntry: Identifiable { let id = UUID(); let text: String; let inColor: Color; let isHeader: Bool; var repeats: Int = 1 }
 
     @Published var status = "启动中…"
     @Published var logEntries: [LogEntry] = []
@@ -86,13 +86,23 @@ final class Engine: ObservableObject {
 
     /// 新条目插在「当前批次时间戳分隔行」之下；没有分隔行则插最顶。
     /// 不再有"批次结束就释放"的逻辑——一旦某批次插了时间戳，它就钉在该批最上方，永不被后续条目挤到下面。
+    /// ★ v37：同一句话 10s 内重复出现时合并为「（×N）」，避免任何异常把日志刷满整屏。
+    private var lastLogAt = Date.distantPast
     private func addEntry(_ text: String, _ color: Color, header: Bool = false) {
         DispatchQueue.main.async {
             let at: Int
             if header { at = 0 }
             else if self.logEntries.first?.isHeader == true { at = 1 }
             else { at = 0 }
+            if !header, at < self.logEntries.count,
+               self.logEntries[at].text == text,
+               Date().timeIntervalSince(self.lastLogAt) < 10 {
+                self.logEntries[at].repeats += 1
+                self.lastLogAt = Date()
+                return
+            }
             self.logEntries.insert(LogEntry(text: text, inColor: color, isHeader: header), at: at)
+            self.lastLogAt = Date()
             if self.logEntries.count > 300 { self.logEntries.removeLast(self.logEntries.count - 300) }
         }
     }
@@ -158,7 +168,8 @@ final class Engine: ObservableObject {
         if didStart { return }; didStart = true
         receiver.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
         // ★ 监听就绪（含被系统挂起后的自动重建）→ 立刻公告一轮，让对端马上刷新本机在线状态
-        receiver.onListening = { [weak self] in self?.onReceiverReady() }
+        //   回调来自监听的串行队列，转回主线程再动 UI 状态
+        receiver.onListening = { [weak self] in DispatchQueue.main.async { self?.onReceiverReady() } }
         // ★ 收到文件已经自动落盘到「下载」（无需手动确认），这里只更新界面记录
         receiver.onSaved = { [weak self] from, name, path in
             DispatchQueue.main.async {
@@ -341,29 +352,46 @@ final class Engine: ObservableObject {
     /// 1s 巡检计数器：每 5 次（≈5s）做一次监听健康检查
     private var healthTick = 0
 
-    /// ★ 监听不在 ready 就重建，并立刻重新公告。
+    /// 监听掉线起始时刻（nil = 正常）。只用来把「一直在重建」压成一条状态，不再每 5s 刷屏。
+    private var listenDownAt: Date?
+
+    /// ★ 监听不在 ready 就重建（带宽限与退避，见 RDReceiver.ensureListening）。
     ///   根因：iOS 把 App 压到后台/被抢占时 NWListener 会掉到 waiting/failed，套接字失效 →
     ///   对端 TCP 连接被 RST（ECONNREFUSED），而 UDP 心跳仍在 → 「显示在线却发不进来」。
+    ///   v37：只在「掉线→重建」和「恢复」两个瞬间各写一条日志。旧实现每次巡检成功重建都写一条，
+    ///   而重建本身又因为误判 waiting 而每 5s 发生一次，于是日志被同一句话刷满。
     func ensureReceiverUp() {
         guard appActive else { return }
-        if receiver.ensureListening() {
-            addLog("接收服务已自动重建（此前被系统挂起导致监听失效）")
-            discovery.announceAll()
+        guard receiver.ensureListening() else { return }
+        discovery.announceAll()
+        let now = Date()
+        if listenDownAt == nil {
+            listenDownAt = now
+            addLog("接收服务未就绪，正在重建…")
+        } else if let t = listenDownAt, now.timeIntervalSince(t) > 180 {
+            // 长时间修不好：每 3 分钟只提醒一次，不刷屏
+            listenDownAt = now
+            addLog("接收服务持续未就绪，仍在后台重试")
         }
     }
 
     /// 回到前台时调用：确认监听可用 + 立刻公告一轮 + 重查 tailnet 目标
     func onForeground() {
         appActive = true
-        _ = receiver.ensureListening()
+        // 前台是「马上就要能收」的时刻：不在 ready 就立刻重建一次（内部限速 3s）
+        receiver.rebuildIfNeededNow()
         // ★ v36：回到前台时**重建 UDP 接收 socket**。换 Wi-Fi / 休眠唤醒后，老 socket
         //   可能一个包都收不到（对端却一切正常）→ 表现为"设备明明在线却看不到"。
         discovery.resetSockets()
         refreshTailscale()
     }
 
-    /// 监听就绪（含重建）→ 立刻公告，让对端第一时间刷新本机在线状态
+    /// 监听就绪（含重建成功）→ 立刻公告，让对端第一时间刷新本机在线状态
     private func onReceiverReady() {
+        if listenDownAt != nil {
+            listenDownAt = nil
+            addLog("接收服务已恢复")
+        }
         discovery.announceAll()
     }
 
@@ -918,7 +946,7 @@ struct ContentView: View {
                         Text(e.text).font(.caption2).foregroundColor(.secondary)
                         Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1)
                     } else {
-                        Text(e.text).font(.caption2).foregroundColor(e.inColor)
+                        Text(e.text + (e.repeats > 1 ? "（×\(e.repeats)）" : "")).font(.caption2).foregroundColor(e.inColor)
                     }
                 }
             }

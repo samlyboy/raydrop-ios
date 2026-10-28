@@ -414,27 +414,39 @@ final class RDReceiver {
     private var listener: NWListener?
     private var current: RDStream?
     private var aborted = false;   // 用户点「终止」→ 与意外中断区分提示
-    /// ★ 监听是否处于 ready。iOS 把 App 压到后台/被系统抢占时，NWListener 会掉到 waiting/failed，
-    ///   套接字随之失效 → 对端 TCP 连接直接被拒（ECONNREFUSED）。而 UDP 发现（裸 socket + 音频保活）
-    ///   仍在工作 → 表现为「列表里显示在线，却怎么都发不进来」。安卓/电脑端用的是常驻
-    ///   ServerSocket / TcpListener，不会有这个现象——这正是「只有苹果端收不到」的根因。
-    private(set) var isListening = false
+    /// ★ 监听状态必须串行化：state handler 在后台队列回调，巡检在主线程调用。
+    ///   旧实现两边各自读写 `isListening` 这个裸 Bool，既有数据竞争，又无法做「宽限 / 退避」——
+    ///   于是每 5s 见到非 ready 就推倒重建一次，日志被「已自动重建」刷屏（见 v37 修复）。
+    private let lq = DispatchQueue(label: "raydrop.listener")
+    private var ready = false                 // 仅在 lq 上读写
+    private var lastRebuildAt = Date.distantPast
+    private var rebuildAttempts = 0
+    /// 监听是否就绪（线程安全读）
+    var isListening: Bool { lq.sync { ready } }
     /// 监听就绪（含重建成功）后回调：让上层立刻重新公告，对端随即刷新本机在线状态
     var onListening: () -> Void = { }
 
     func start() {
         aborted = false
-        beginListening()
+        lq.sync { beginListeningLocked() }
     }
 
-    /// 建立（或重建）监听。可重复调用：先废弃旧监听再新建，避免端口占用。
-    private func beginListening() {
+    /// 建立（或重建）监听。**只允许在 lq 上调用**：先废弃旧监听再新建，避免端口占用。
+    private func beginListeningLocked() {
         listener?.stateUpdateHandler = nil
         listener?.cancel()
         listener = nil
-        isListening = false
+        ready = false
+        lastRebuildAt = Date()
         do {
-            let l = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: RD.tcpPort)!)
+            // ★ 关键：必须允许复用本地端口。
+            //   iOS 把 App 挂起 / 抢占后，旧监听的内核 socket 可能还占着 41235，
+            //   不允许复用时新监听会一直停在 .waiting(POSIX 48 EADDRINUSE)，
+            //   永远到不了 .ready → 巡检又判定"没就绪"→ 再重建 → 无限空转、日志刷屏。
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            params.noDelay = true
+            let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: RD.tcpPort)!)
             l.newConnectionHandler = { (conn: NWConnection) in
                 conn.start(queue: DispatchQueue.global())
                 let stream = RDStream(conn)
@@ -443,15 +455,27 @@ final class RDReceiver {
             }
             l.stateUpdateHandler = { [weak self] st in
                 guard let self else { return }
-                switch st {
-                case .ready:
-                    self.isListening = true
-                    self.onStatus("接收服务已开启")
-                    self.onListening()
-                case .failed, .cancelled, .waiting:
-                    self.isListening = false
-                default:
-                    break
+                self.lq.async {
+                    switch st {
+                    case .ready:
+                        self.ready = true
+                        self.rebuildAttempts = 0
+                        self.onStatus("接收服务已开启")
+                        // 就绪即公告一轮（含首次启动与每次重建）：让对端立刻刷新本机在线状态。
+                        // 是否写日志由上层判断（只在「掉线→恢复」时写一条），这里不产生噪音。
+                        self.onListening()
+                    case .failed:
+                        // failed 是终态，NWListener 不会自行恢复 → 允许下一轮巡检立刻重建
+                        self.ready = false
+                        self.lastRebuildAt = .distantPast
+                    case .waiting, .cancelled:
+                        // ★ waiting 是**可恢复**状态（换网、休眠唤醒、端口瞬时占用）：
+                        //   网络回来时 NWListener 会自己回到 ready。旧实现把它当失效立刻重建，
+                        //   正是"明明一直在收、却反复重建刷屏"的根源。此处只标记不就绪，交给系统。
+                        self.ready = false
+                    default:
+                        break
+                    }
                 }
             }
             l.start(queue: DispatchQueue.global())
@@ -461,15 +485,52 @@ final class RDReceiver {
         }
     }
 
-    /// ★ 巡检自愈：不在 ready 就重建监听（NWListener 掉到 waiting/failed 后不会自行恢复）。
-    ///   返回 true 表示本次确实重建了一次。
+    /// 监听当前是否真的 ready（以 NWListener.state 为权威值，仅在 lq 上调用）。
+    /// 不用 `==` 比较：NWListener.State 带关联值，用模式匹配最稳。
+    private var listenerReady: Bool {
+        guard let l = listener else { return false }
+        if case .ready = l.state { return true }
+        return false
+    }
+
+    /// 回到前台时调用：不在 ready 就立刻重建一次（前台重建不算失败重试，重置退避）。
+    /// 后台挂起后监听常停在 waiting，靠系统自愈可能要等十几秒；前台是「马上就要能收」的时刻，
+    /// 所以这里主动重建一次。但限速 3s，避免 scenePhase 短时间抖动导致连续重建。
+    func rebuildIfNeededNow() {
+        lq.sync {
+            if listenerReady { ready = true; return }
+            if Date().timeIntervalSince(lastRebuildAt) < 3 { return }
+            beginListeningLocked()
+            rebuildAttempts = 0
+        }
+    }
+
+    /// ★ 巡检自愈。返回 true 表示本次确实重建了一次监听。
+    ///   修 v36 的两个错误：
+    ///   ① `waiting` 被当成失效 → 立刻重建。但 waiting 是系统会自动恢复的状态，
+    ///      重建反而把正在恢复的监听打断，于是永远卡在 waiting、每 5s 重建一次。
+    ///   ② 没有退避。连续重建失败会以 5s 频率无限重试，白耗电还把日志刷满。
+    ///   现在：waiting 先给 20s 自愈宽限；真正重建按 20→40→80→160s 递增退避，最长 5 分钟一次。
     @discardableResult
     func ensureListening() -> Bool {
-        if isListening { return false }
-        // 刚启动、尚未 ready：给一点宽限，避免把正在建立的监听反复推倒重建
-        if let l = listener, case .setup = l.state { return false }
-        beginListening()
-        return true
+        var did = false
+        lq.sync {
+            // ★ 以 NWListener.state 为准（它是权威值），避免回调丢失 / 读写竞争导致「明明 ready 却判定不就绪」，
+            //   否则就会每 5s 把正常工作的监听推倒重建一次。
+            if listenerReady { ready = true; return }
+            if ready { return }
+            let now = Date()
+            let sinceRebuild = now.timeIntervalSince(lastRebuildAt)
+            // 刚建的监听还在建立 / 等系统恢复：给 20s 宽限，别推倒重来
+            if sinceRebuild < 20 { return }
+            // 连续重建失败 → 指数退避，最多 5 分钟一次，避免空转耗电
+            let cap = min(300.0, 20.0 * pow(2.0, Double(max(0, rebuildAttempts - 1))))
+            if rebuildAttempts > 0 && sinceRebuild < cap { return }
+            beginListeningLocked()
+            rebuildAttempts += 1
+            did = true
+        }
+        return did
     }
 
     func pause() { current?.setPaused(true) }
