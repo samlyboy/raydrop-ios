@@ -93,8 +93,27 @@ enum RDMediaSaver {
 
     /// 把「下载」里**已落盘**的文件额外存一份进相册（不移动、不删除、不改内容）。
     static func saveExisting(file: URL, name: String, mime: String, completion: @escaping Done) {
-        let isVideo = RD.isVideoFile(name: name, mime: mime)
-        let isImage = RD.isImageFile(name: name, mime: mime)
+        // ★★ v43 关键修复：媒体种类一律以**文件头魔数**为准，name/mime 只作兜底。
+        //
+        //   真机故障（iOS 17 → iOS 15 视频只进「下载」不进相册）：
+        //   那段视频在相册里的原始文件名就是 `106644.jpeg`，于是发送端按扩展名算出
+        //   `image/jpeg`，这里按 name/mime 判成「图片」→ 拿 `addResource(.photo)` 去写一个
+        //   9.8MB 的 QuickTime 容器 → PhotoKit 直接拒收 `PHPhotosErrorDomain#3302`，
+        //   而真正该走的 6 条视频路径（含苹果标准入口）**一条都没试**。
+        //   名字会撒谎（相册导出、聊天软件保存、第三方 App 导入都会改名字），字节不会。
+        let sniffed = sniffExt(file)
+        let videoExts: Set<String> = ["mov", "mp4", "m4v", "3gp", "3g2", "avi", "mkv",
+                                      "webm", "ts", "mpg", "mpeg", "wmv", "flv"]
+        let isVideo: Bool
+        let isImage: Bool
+        if let s = sniffed {
+            isVideo = videoExts.contains(s)
+            isImage = !isVideo
+        } else {
+            // 魔数认不出（极少数封装）→ 退回按名字/mime 判
+            isVideo = RD.isVideoFile(name: name, mime: mime)
+            isImage = RD.isImageFile(name: name, mime: mime)
+        }
         guard isVideo || isImage else {
             // 非媒体文件（.pdf/.zip/.txt…）本来就不该进相册
             completion(true, "")

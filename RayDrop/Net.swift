@@ -631,7 +631,7 @@ final class RDReceiver {
                     continue
                 }
 
-                let isMedia = RD.isImageFile(name: name, mime: mime) || RD.isVideoFile(name: name, mime: mime)
+                let isMediaHint = RD.isImageFile(name: name, mime: mime) || RD.isVideoFile(name: name, mime: mime)
                 let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("rd_\(UUID().uuidString)")
                 FileManager.default.createFile(atPath: tmp.path, contents: nil)
                 let handle = try FileHandle(forWritingTo: tmp)
@@ -648,9 +648,29 @@ final class RDReceiver {
                 }
                 try? handle.close()
 
+                // ★ v43：落盘前按**文件头魔数**纠正扩展名与 mime。
+                //   对端（老版本 RayDrop，或相册里原始文件名怪异的资产）可能把 mov 叫成 .jpeg，
+                //   于是这里判成图片 → 写相册走 addResource(.photo) → PhotoKit 报 3302。
+                //   只改文件名，不动一个字节。
+                var finalName = name
+                var finalMime = mime
+                if let sniffed = RDMediaSaver.sniffExt(tmp) {
+                    let cur = (name as NSString).pathExtension.lowercased()
+                    let want = sniffed.lowercased()
+                    let sameJPEG = (cur == "jpg" || cur == "jpeg") && (want == "jpg" || want == "jpeg")
+                    if cur != want && !sameJPEG {
+                        finalName = (name as NSString).deletingPathExtension + "." + want
+                        finalMime = RD.mime(for: finalName)
+                        onStatus("按真实格式更名：\(name) → \(finalName)")
+                    }
+                }
+                let isMedia = isMediaHint
+                    || RD.isImageFile(name: finalName, mime: finalMime)
+                    || RD.isVideoFile(name: finalName, mime: finalMime)
+
                 var ack: [String: Any] = ["ack": i]
                 // ★ 一律自动落盘到「下载」：先让文件真正归位（这一步不弹任何界面）
-                let dst = RD.downloadsURL(named: name)
+                let dst = RD.downloadsURL(named: finalName)
                 var saved = false
                 do {
                     try FileManager.default.moveItem(at: tmp, to: dst)
@@ -670,21 +690,21 @@ final class RDReceiver {
                     // 图片/视频：额外存一份进系统「相册」（「下载」里那份保留，不移动不删除）。
                     // 相册失败只提示、不中断——文件已在「下载」里，发送端显示成功是真实的。
                     let res: (Bool, String) = await withCheckedContinuation { cont in
-                        RDMediaSaver.saveExisting(file: dst, name: name, mime: mime) { ok, err in
+                        RDMediaSaver.saveExisting(file: dst, name: finalName, mime: finalMime) { ok, err in
                             cont.resume(returning: (ok, err))
                         }
                     }
                     if res.0 {
-                        onStatus("已存相册：\(name)")
+                        onStatus("已存相册：\(finalName)")
                     } else {
                         // ★ 视频写相册失败是最容易被误认为"没收到"的：文件其实在「下载」里，
                         //   但用户在相册里找不到。必须把原因连文件名一起报出来。
-                        let why = res.1.count > 140 ? String(res.1.prefix(140)) + "…" : res.1
-                        albumFailed.append("\(name)（\(why)）")
-                        onStatus("已存「下载」，但写入相册失败：\(name)（\(why)）")
+                        let why = res.1.count > 200 ? String(res.1.prefix(200)) + "…" : res.1
+                        albumFailed.append("\(finalName)（\(why)）")
+                        onStatus("已存「下载」，但写入相册失败：\(finalName)（\(why)）")
                     }
                 }
-                if saved { onSaved(fromName, name, dst.path) }
+                if saved { onSaved(fromName, finalName, dst.path) }
                 RDWrite.line(s.conn, ack)   // 收完才放行下一个
             }
             _ = try? await s.readLine()   // done

@@ -518,7 +518,7 @@ final class Engine: ObservableObject {
                         fails.append("\(name)（0 字节，可能是空文件或尚未下载完）")
                         continue
                     }
-                    okURLs.append(dst)
+                    okURLs.append(Engine.alignExtension(dst))   // 扩展名与真实容器对齐（只改名）
                 } catch {
                     fails.append("\(name)（\(error.localizedDescription)）")
                 }
@@ -604,25 +604,163 @@ final class Engine: ObservableObject {
         return nil
     }
 
-    /// 取一个 provider 的本地文件副本。视频失败重试一次（偶发占用冲突）。
-    private static func loadRepresentation(_ provider: NSItemProvider, typeID: String, isVideo: Bool) -> URL? {
-        let attempts = isVideo ? 2 : 1
-        for attempt in 0..<attempts {
-            var out: URL?
-            let sem = DispatchSemaphore(value: 0)
-            provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, err in
-                // ⚠️ 系统给的临时文件在回调返回后即被删除 → 必须在本回调内同步复制进沙盒
-                if let url { out = Engine.copyIntoSandbox(url, isVideo: isVideo, typeID: typeID) }
-                if let err = err { print("[RayDrop] load \(typeID) failed: \(err.localizedDescription)") }
-                sem.signal()
-            }
-            if sem.wait(timeout: .now() + 300) == .timedOut {
-                print("[RayDrop] load \(typeID) timed out")
-            }
-            if let u = out { return u }
-            if attempt + 1 < attempts { Thread.sleep(forTimeInterval: 0.4) }
+    /// 只允许 resume 一次的包装（provider 回调与超时可能同时到达，二次 resume 会直接崩）
+    private final class Once<T> {
+        private let lock = NSLock()
+        private var cont: CheckedContinuation<T, Never>?
+        init(_ c: CheckedContinuation<T, Never>) { cont = c }
+        func fire(_ v: T) {
+            lock.lock()
+            guard let c = cont else { lock.unlock(); return }
+            cont = nil
+            lock.unlock()
+            c.resume(returning: v)
         }
-        return nil
+    }
+
+    // MARK: - ★ v43 取文件：类型候选链 + 字节兜底 + 名字与字节对齐
+
+    /// 一个 provider 的「可用类型候选」，按「最可能拿到原文件」排序。
+    ///
+    /// 为什么要一整条链：真机上 iOS 15 对视频 `loadFileRepresentation` 会直接失败，
+    /// 而旧实现**只试一个**类型标识就放弃 → 用户看到「已选 1 项」，视频凭空消失。
+    /// 具体类型（com.apple.quicktime-movie 等）系统会直给原文件、不转码，所以排前面；
+    /// 笼统的 public.movie / public.image 排后面兜底。
+    private static func typeCandidates(_ provider: NSItemProvider, primary: String, isVideo: Bool) -> [String] {
+        var list: [String] = []
+        func add(_ id: String) {
+            guard !id.isEmpty, !list.contains(id) else { return }
+            guard provider.hasItemConformingToTypeIdentifier(id) else { return }
+            list.append(id)
+        }
+        add(primary)
+        for id in provider.registeredTypeIdentifiers {
+            guard let t = UTType(id) else { continue }
+            if isVideo {
+                if t.conforms(to: .movie) || t.conforms(to: .video) || t.conforms(to: .audiovisualContent) { add(id) }
+            } else if t.conforms(to: .image) {
+                add(id)
+            }
+        }
+        if isVideo {
+            for t in [UTType.quickTimeMovie, .mpeg4Movie, .movie, .video, .audiovisualContent] { add(t.identifier) }
+        } else {
+            for t in [UTType.jpeg, .png, .heic, .gif, .webP, .tiff, .image] { add(t.identifier) }
+        }
+        return list
+    }
+
+    /// 单次 `loadFileRepresentation` + 超时。返回 (沙盒副本, 失败原因)。
+    /// 不用 DispatchSemaphore 阻塞线程：旧写法一次卡 300 秒，两条并发就把工作队列占死，
+    /// 后续再选一次都排不进去（表现为「点了没反应」）。
+    private static func awaitFile(_ provider: NSItemProvider, typeID: String,
+                                  isVideo: Bool, timeout: TimeInterval) async -> (URL?, String) {
+        await withCheckedContinuation { (cont: CheckedContinuation<(URL?, String), Never>) in
+            let once = Once<(URL?, String)>(cont)
+            provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, err in
+                // ⚠️ 系统给的临时文件在回调返回后即被删除 → 必须在回调内同步复制进沙盒
+                if let u = url {
+                    if let copy = Engine.copyIntoSandbox(u, isVideo: isVideo, typeID: typeID) {
+                        once.fire((copy, ""))
+                    } else {
+                        once.fire((nil, "复制进沙盒失败"))
+                    }
+                } else {
+                    once.fire((nil, err.map { $0.localizedDescription } ?? "系统没有返回文件"))
+                }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                once.fire((nil, "超过 \(Int(timeout)) 秒无响应"))
+            }
+        }
+    }
+
+    /// 兜底通道：有些资产/系统版本只支持 data 通道，给不出临时文件 URL
+    private static func awaitData(_ provider: NSItemProvider, typeID: String,
+                                  timeout: TimeInterval) async -> (Data?, String) {
+        await withCheckedContinuation { (cont: CheckedContinuation<(Data?, String), Never>) in
+            let once = Once<(Data?, String)>(cont)
+            provider.loadDataRepresentation(forTypeIdentifier: typeID) { data, err in
+                if let d = data, !d.isEmpty {
+                    once.fire((d, ""))
+                } else {
+                    once.fire((nil, err.map { $0.localizedDescription } ?? "系统没有返回数据"))
+                }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                once.fire((nil, "超过 \(Int(timeout)) 秒无响应"))
+            }
+        }
+    }
+
+    /// 把内存字节写成沙盒文件（扩展名按类型标识补，没有就按视频/图片猜）
+    private static func writeSandbox(_ data: Data, typeID: String, isVideo: Bool) -> URL? {
+        let ext = UTType(typeID)?.preferredFilenameExtension ?? (isVideo ? "mov" : "jpg")
+        let dst = makeTempSlot(for: "picked_" + String(UUID().uuidString.prefix(8)) + "." + ext)
+        do {
+            try data.write(to: dst, options: .atomic)
+            return dst
+        } catch {
+            print("[RayDrop] write bytes failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// ★ 让文件名的扩展名与**真实字节**一致（只改名，一个字节都不动）。
+    ///
+    /// 这是「iOS 17 → iOS 15 视频进不了相册」的源头：那段视频原名是 `106644.jpeg`
+    /// （相册里这条资产的原始文件名就是 .jpeg），发送端按扩展名算出 `image/jpeg`，
+    /// 接收端于是把 9.8MB 的 QuickTime 容器当图片，用 `addResource(.photo)` 去写 →
+    /// PhotoKit 直接拒收 `PHPhotosErrorDomain#3302`，而真正该走的视频路径一条都没试。
+    /// 文件名会撒谎，文件头魔数不会。
+    static func alignExtension(_ url: URL) -> URL {
+        guard let sniffed = RDMediaSaver.sniffExt(url) else { return url }
+        let cur = url.pathExtension.lowercased()
+        let want = sniffed.lowercased()
+        if cur == want { return url }
+        // jpg / jpeg 视为同一族，不做改名（避免无意义的重命名）
+        if (cur == "jpg" || cur == "jpeg") && (want == "jpg" || want == "jpeg") { return url }
+        let dir = url.deletingLastPathComponent()
+        let stem = (url.lastPathComponent as NSString).deletingPathExtension
+        let dst = dir.appendingPathComponent(stem + "." + want)
+        do {
+            if FileManager.default.fileExists(atPath: dst.path) { try? FileManager.default.removeItem(at: dst) }
+            try FileManager.default.moveItem(at: url, to: dst)
+            print("[RayDrop] 扩展名按真实容器纠正：\(url.lastPathComponent) → \(dst.lastPathComponent)")
+            return dst
+        } catch {
+            return url
+        }
+    }
+
+    /// 取一项：类型候选链逐个试 file 通道，全失败再用 data 通道兜底。
+    /// 失败时把**每一步的真实原因**带回去（不再只说「第 1 项视频」）。
+    ///
+    /// 时长控制：整项设总预算（视频 240s / 照片 90s），第一档给足 180s
+    /// （iCloud 里未下载的大视频要等它落地），后续档位只给 25s ——
+    /// 失败的 provider 通常立刻报错，给它长超时只会白等，不能让用户对着界面干等十几分钟。
+    private static func loadOne(_ provider: NSItemProvider, typeID: String, isVideo: Bool) async -> (URL?, String) {
+        var reasons: [String] = []
+        let cands = typeCandidates(provider, primary: typeID, isVideo: isVideo)
+        let deadline = Date().addingTimeInterval(isVideo ? 240 : 90)
+        for (n, id) in cands.enumerated() {
+            let left = deadline.timeIntervalSinceNow
+            if left < 5 { break }
+            let budget = min(left, n == 0 ? 180 : 25)
+            let (u, why) = await awaitFile(provider, typeID: id, isVideo: isVideo, timeout: budget)
+            if let u = u { return (alignExtension(u), "") }
+            reasons.append("\(id)：\(why)")
+        }
+        for (n, id) in cands.prefix(3).enumerated() {
+            let left = deadline.timeIntervalSinceNow
+            if left < 5 { break }
+            let (d, why) = await awaitData(provider, typeID: id, timeout: min(left, n == 0 ? 120 : 20))
+            if let d = d, let u = writeSandbox(d, typeID: id, isVideo: isVideo) {
+                return (alignExtension(u), "")
+            }
+            reasons.append("data \(id)：\(why)")
+        }
+        return (nil, reasons.prefix(3).joined(separator: "；"))
     }
 
     /// 复制进沙盒临时槽位，并**保证有扩展名**（没有扩展名对端判不出 mime、也进不了相册）。
@@ -631,6 +769,12 @@ final class Engine: ObservableObject {
         let fm = FileManager.default
         var name = src.lastPathComponent
         if name.isEmpty { name = "picked_" + UUID().uuidString }
+        // 目录（实况照片的 .pvt 包等）：原样拷进来也发不出去，直接判失败并说明
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: src.path, isDirectory: &isDir), isDir.boolValue {
+            print("[RayDrop] skip directory provider output: \(name)")
+            return nil
+        }
         if (name as NSString).pathExtension.isEmpty {
             let ext = UTType(typeID)?.preferredFilenameExtension ?? (isVideo ? "mov" : "jpg")
             name += "." + ext
@@ -652,77 +796,88 @@ final class Engine: ObservableObject {
         }
     }
 
-/// `done` 在所有项读完后回调（主线程）。providers 由本方法捕获的 `results` 持有，
+    /// `done` 在所有项读完后回调（主线程）。providers 由本方法捕获的 `results` 持有，
     /// 与 picker 是否销毁无关 —— 所以调用方可以立即关掉 sheet，加载照常进行。
     ///
-    /// 并发模型：为避免「在队列上阻塞等信号量、而工作项又在同一队列里排队」造成线程池耗尽，
-    /// 这里改成**手动槽位调度** —— 主循环只负责派发，不阻塞；每个工作项结束后自己派发下一个。
+    /// 并发模型：小批推进（每批 2 项），批与批之间串行。不用信号量阻塞线程池，
+    /// 也不会因为两条大视频同时导出而把内存撑爆。
     func preparePhotos(_ results: [PHPickerResult], done: @escaping () -> Void) {
         guard !results.isEmpty else { done(); return }
         let total = results.count
-        // ★ 读取期间置 preparing：此时点设备要提示「正在读取，请稍等」，
-        //   而不是旧版的「请先选择内容」——用户明明刚选完，提示却像是没选。
-        DispatchQueue.main.async { self.preparing = true; self.status = "正在读取 \(total) 项…" }
+        preparing = true
+        status = "正在读取 \(total) 项…"
 
-        // 先在主线程把每项的 (provider, 类型) 解析出来（轻量，不涉 IO）
+        // 类型解析放主线程做（纯查表，不涉 IO）
         var jobs: [(idx: Int, provider: NSItemProvider, typeID: String, isVideo: Bool)] = []
-        var fails: [String] = []
+        var errs: [Int: String] = [:]
+        var kindOf: [Int: String] = [:]
         for (idx, r) in results.enumerated() {
             guard let pick = Engine.resolvePickType(r.itemProvider) else {
-                fails.append("第 \(idx + 1) 项（无法识别类型）")
+                errs[idx] = "无法识别类型"
+                kindOf[idx] = "内容"
                 continue
             }
             jobs.append((idx, r.itemProvider, pick.id, pick.isVideo))
+            kindOf[idx] = pick.isVideo ? "视频" : "照片"
         }
 
-        let lock = NSLock()
-        var slots: [URL?] = Array(repeating: nil, count: total)
-        var failed = fails
-        var next = 0
-        let maxConcurrent = 2
-        let group = DispatchGroup()
-
-        /// 派发下一个任务（在锁内取任务号，避免竞态）
-        func dispatchNext() {
-            lock.lock()
-            guard next < jobs.count else { lock.unlock(); return }
-            let job = jobs[next]; next += 1
-            lock.unlock()
-
-            group.enter()
-            DispatchQueue.global(qos: .userInitiated).async {
-                let url = Engine.loadRepresentation(job.provider, typeID: job.typeID, isVideo: job.isVideo)
-                lock.lock()
-                if let u = url { slots[job.idx] = u }
-                else { failed.append("第 \(job.idx + 1) 项\(job.isVideo ? "视频" : "照片")") }
-                lock.unlock()
-                group.leave()
-                dispatchNext()          // 本项结束，接力派发下一项（保持并发上限）
-            }
-        }
-        for _ in 0..<min(maxConcurrent, jobs.count) { dispatchNext() }
-
-        group.notify(queue: .main) {
-            self.preparing = false
-            let ok = slots.compactMap { $0 }
-            let failedList = failed.sorted()
-            if ok.isEmpty {
-                self.pendingItems = []
-                self.pendingSummary = ""
-                self.status = failedList.isEmpty ? "没有选中任何内容" : "读取失败，未加入待发"
-                if !failedList.isEmpty { self.addLog("以下内容读取失败：\(failedList.joined(separator: "、"))") }
-            } else {
-                self.pendingItems = ok.map { .file($0) }
-                self.pendingSummary = "已选 \(ok.count) 项"
-                if failedList.isEmpty {
-                    self.status = "已选 \(ok.count) 项，点下方设备发送"
-                } else {
-                    // ★ 关键：失败绝不静默。旧实现吞掉 error，用户以为全选中，实际只发出去一部分。
-                    self.status = "已选 \(ok.count) 项，另有 \(failedList.count) 项读取失败"
-                    self.addLog("有 \(failedList.count) 项未能加入待发：\(failedList.joined(separator: "、"))")
+        let snapshot = jobs
+        let failedSeed = errs
+        let kindSeed = kindOf
+        Task.detached(priority: .userInitiated) {
+            // 拷成局部变量再改：避免在并发闭包里直接改外部 var
+            var errs = failedSeed
+            var kindOf = kindSeed
+            var slots: [URL?] = Array(repeating: nil, count: total)
+            var finished = 0
+            var i = 0
+            while i < snapshot.count {
+                let batch = Array(snapshot[i..<min(i + 2, snapshot.count)])
+                await withTaskGroup(of: (Int, URL?, String).self) { group in
+                    for j in batch {
+                        group.addTask {
+                            let (u, why) = await Engine.loadOne(j.provider, typeID: j.typeID, isVideo: j.isVideo)
+                            return (j.idx, u, why)
+                        }
+                    }
+                    for await r in group {
+                        slots[r.0] = r.1
+                        if r.1 == nil { errs[r.0] = r.2.isEmpty ? "未知原因" : r.2 }
+                        finished += 1
+                        let f = finished
+                        DispatchQueue.main.async { self.status = "正在读取 \(f)/\(total) 项…" }
+                    }
                 }
+                i += batch.count
             }
-            done()
+
+            let ok = slots.compactMap { $0 }
+            let failedList: [String] = errs.keys.sorted().map { idx in
+                let why = errs[idx] ?? "未知原因"
+                let short = why.count > 70 ? String(why.prefix(70)) + "…" : why
+                return "第 \(idx + 1) 项\(kindOf[idx] ?? "内容")（\(short)）"
+            }
+
+            DispatchQueue.main.async {
+                self.preparing = false
+                if ok.isEmpty {
+                    self.pendingItems = []
+                    self.pendingSummary = ""
+                    self.status = failedList.isEmpty ? "没有选中任何内容" : "读取失败，未加入待发"
+                    if !failedList.isEmpty { self.addLog("以下内容读取失败：\(failedList.joined(separator: "、"))") }
+                } else {
+                    self.pendingItems = ok.map { .file($0) }
+                    self.pendingSummary = "已选 \(ok.count) 项"
+                    if failedList.isEmpty {
+                        self.status = "已选 \(ok.count) 项，点下方设备发送"
+                    } else {
+                        // ★ 失败绝不静默：给出是哪一项、什么原因（不再只有「第 1 项视频」）
+                        self.status = "已选 \(ok.count) 项，另有 \(failedList.count) 项读取失败"
+                        self.addLog("有 \(failedList.count) 项未能加入待发：\(failedList.joined(separator: "；"))")
+                    }
+                }
+                done()
+            }
         }
     }
 
@@ -845,9 +1000,6 @@ final class Engine: ObservableObject {
                 let real = name.hasPrefix("f_") ? String(name.dropFirst(2)) : name
                 let attrs = (try? FileManager.default.attributesOfItem(atPath: f.path)) ?? [:]
                 let sz = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-                let ext = (real as NSString).pathExtension.lowercased()
-                let isImg = ["jpg","jpeg","png","heic","webp","gif","bmp"].contains(ext)
-                let isVid = ["mp4","mov","mkv","avi"].contains(ext)
                 // 移到临时目录（App Group 容器文件不能长期引用），同时从 inbox 移除。
                 // ★ 放进独立 UUID 子目录、保留原名——绝不能在文件名前拼 UUID（那串会跟着发给对端）
                 let tmp = tempSlot(for: real)
@@ -858,8 +1010,14 @@ final class Engine: ObservableObject {
                     try? FileManager.default.copyItem(at: f, to: tmp)
                     try? FileManager.default.removeItem(at: f)
                 }
-                got.append(SharedItem(url: tmp, text: nil, name: real, size: sz, kind: "file",
-                                      isImage: isImg, isVideo: isVid))
+                // ★ v43：扩展名按真实容器纠正（分享进来的 .jpeg 也可能是个 mov）
+                let aligned = Engine.alignExtension(tmp)
+                let finalName = aligned.lastPathComponent
+                let fext = (finalName as NSString).pathExtension.lowercased()
+                let fIsImg = ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp"].contains(fext)
+                let fIsVid = ["mp4", "mov", "m4v", "mkv", "avi", "3gp", "ts"].contains(fext)
+                got.append(SharedItem(url: aligned, text: nil, name: finalName, size: sz, kind: "file",
+                                      isImage: fIsImg, isVideo: fIsVid))
             }
         }
         DispatchQueue.main.async {
