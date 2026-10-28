@@ -470,8 +470,10 @@ final class RDReceiver {
                     } else {
                         // ★ 视频写相册失败是最容易被误认为"没收到"的：文件其实在「下载」里，
                         //   但用户在相册里找不到。必须把原因连文件名一起报出来，别只说"写入相册失败"。
-                        albumFailed.append("\(name)（\(res.1)）")
-                        onStatus("已存「下载」，但写入相册失败：\(name)（\(res.1)）")
+                        //   多策略兜底后原因可能较长，日志里截断，完整原因靠第一步的 NSError 即可定位。
+                        let why = res.1.count > 140 ? String(res.1.prefix(140)) + "…" : res.1
+                        albumFailed.append("\(name)（\(why)）")
+                        onStatus("已存「下载」，但写入相册失败：\(name)（\(why)）")
                     }
                 }
                 if saved { onSaved(fromName, name, dst.path) }

@@ -424,6 +424,16 @@ final class Engine: ObservableObject {
            provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
             return (UTType.image.identifier, false)
         }
+        // ★ 优先请求 provider 实际注册的**具体**视频类型（com.apple.quicktime-movie / public.mpeg-4…），
+        //   而不是笼统的 public.movie —— 只有要具体类型，系统才直接给原文件，
+        //   不会为了"符合 public.movie"去导出/转码（大视频转码慢且容易中途失败）。
+        let generic: Set<String> = [UTType.movie.identifier, UTType.video.identifier,
+                                    UTType.audiovisualContent.identifier, UTType.content.identifier,
+                                    UTType.item.identifier, UTType.data.identifier]
+        for id in provider.registeredTypeIdentifiers where !generic.contains(id) {
+            guard let t = UTType(id) else { continue }
+            if t.conforms(to: .movie) || t.conforms(to: .video) { return (id, true) }
+        }
         let videoCandidates: [UTType] = [.movie, .video, .audiovisualContent, .quickTimeMovie, .mpeg4Movie]
         for t in videoCandidates where provider.hasItemConformingToTypeIdentifier(t.identifier) {
             return (t.identifier, true)
