@@ -489,8 +489,14 @@ final class RDReceiver {
             }
             onEnd(!saveFailed, saveFailed ? "部分文件保存失败" : "接收完成")
         } catch {
-            if aborted { onStatus("已终止"); onEnd(false, "已终止") }
-            else { onStatus("接收中断"); onEnd(false, "接收中断") }
+            if aborted { onStatus("已终止"); onEnd(false, "已终止"); return }
+            // ★ 停滞超时：对端断网/走远时收不到任何字节，旧实现会无限等待（界面像卡死）
+            if let re = error as? RDStream.ReadError, case .stalled = re {
+                onStatus("接收中断：对端长时间没有数据，连接可能已断开")
+                onEnd(false, "接收超时")
+                return
+            }
+            onStatus("接收中断"); onEnd(false, "接收中断")
         }
     }
 }
@@ -562,7 +568,8 @@ final class RDSender {
 
     private func doSend(peer: String, items: [SendItem], done: @escaping (Bool) -> Void) {
         Task {
-            let s = RDStream(conn!)
+            // 发送端等 ACK 时，对面可能正在把大视频写进相册（几 GB 要几十秒）→ 给足 10 分钟
+            let s = RDStream(conn!, stallTimeout: 600)
             do {
                 RDWrite.line(conn!, ["app": RD.app, "v": RD.ver, "name": RDStore.shared.myName,
                                       "code": RDStore.shared.myCode, "count": items.count])

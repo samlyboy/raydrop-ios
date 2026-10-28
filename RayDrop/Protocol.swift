@@ -115,7 +115,7 @@ enum RD {
 
 /// 基于 NWConnection 的带缓冲异步流：精确读 n 字节 / 读一行 / 读 4字节长度前缀 JSON。
 final class RDStream {
-    enum ReadError: Error { case closed }
+    enum ReadError: Error { case closed, stalled }
 
     let conn: NWConnection
     private let queue = DispatchQueue(label: "raydrop.stream")
@@ -125,11 +125,41 @@ final class RDStream {
     /// 暂停：停止继续读取（数据留在内核缓冲，恢复后接着读）；终止：直接 cancel 连接
     private(set) var isPaused = false
     private var pumping = false
+    /// ★ 停滞看门狗：对端 Wi-Fi 掉线/走远时，NWConnection 可能长时间既不送来数据也不报错，
+    ///   接收端就会在 `read(n)` 上无限等待（声明了 size、字节却永远不来）。超时即判定连接已死。
+    ///   发送端等 ACK 时那边可能正在把大视频写进相册，所以要给足时间（见 doSend）。
+    private let stallTimeout: TimeInterval
+    private var watchdog: DispatchWorkItem?
 
     /// 调用方需确保 conn 已 start()。receiver 在 newConnectionHandler 里 start，sender 在连接 ready 后创建。
-    init(_ conn: NWConnection) {
+    init(_ conn: NWConnection, stallTimeout: TimeInterval = 60) {
         self.conn = conn
+        self.stallTimeout = stallTimeout
         pump()
+    }
+
+    deinit { watchdog?.cancel() }
+
+    /// 有等待中的读取时启动（或重置）停滞计时
+    private func armWatchdog() {
+        watchdog?.cancel()
+        guard pending != nil else { return }
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.queue.async {
+                guard let p = self.pending else { return }
+                self.pending = nil
+                self.failed = ReadError.stalled
+                p.cont.resume(throwing: ReadError.stalled)
+            }
+        }
+        watchdog = w
+        queue.asyncAfter(deadline: .now() + stallTimeout, execute: w)
+    }
+
+    private func disarmWatchdog() {
+        watchdog?.cancel()
+        watchdog = nil
     }
 
     private func pump() {
@@ -143,6 +173,7 @@ final class RDStream {
                 if let e = error { self.failed = e }
                 if isComplete && self.failed == nil { self.failed = ReadError.closed }
                 self.fulfillPending()
+                if self.pending != nil { self.armWatchdog() }   // 有新字节到达 → 重置停滞计时
                 if self.failed == nil && !self.isPaused { self.pump() }
             }
         }
@@ -163,9 +194,9 @@ final class RDStream {
         //   把**已完整到达缓冲区**的最后一份数据直接丢弃并抛错 → 最后一个文件（常是视频）丢。
         if buffer.count >= p.n {
             let d = Data(buffer.prefix(p.n)); buffer.removeFirst(p.n)
-            pending = nil; p.cont.resume(returning: d)
+            pending = nil; disarmWatchdog(); p.cont.resume(returning: d)
         } else if let e = failed {
-            pending = nil; p.cont.resume(throwing: e)
+            pending = nil; disarmWatchdog(); p.cont.resume(throwing: e)
         }
     }
 
@@ -175,11 +206,13 @@ final class RDStream {
             queue.async {
                 // ★ 同样的问题：缓冲够就先给数据，别因为「对端刚关连接」把已到的字节吞掉
                 if self.buffer.count >= n {
-                    let d = Data(self.buffer.prefix(n)); self.buffer.removeFirst(n); cont.resume(returning: d); return
+                    let d = Data(self.buffer.prefix(n)); self.buffer.removeFirst(n)
+                    self.disarmWatchdog(); cont.resume(returning: d); return
                 }
-                if let e = self.failed { cont.resume(throwing: e); return }
+                if let e = self.failed { self.disarmWatchdog(); cont.resume(throwing: e); return }
                 if let old = self.pending { old.cont.resume(throwing: ReadError.closed) }
                 self.pending = (n, cont)
+                self.armWatchdog()
             }
         }
     }
