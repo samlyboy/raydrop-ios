@@ -48,10 +48,11 @@ final class Engine: ObservableObject {
     @Published var myName = RDStore.shared.myName
     @Published var devices: [DeviceInfo] = []
     /// ★ 通道存活窗口：公告/探测周期 2s。窗口需容忍链路抖动与丢包，否则一两次丢包就误判离线、列表反复上下线。
-    ///   LAN 10s（容 4 次丢包）/ TS 20s（跨洲 DERP + iOS 后台抖动，容 9 次丢包）。
+    ///   v36：LAN 10→25s、TS 20→45s。原窗口太紧（LAN 只容 4 次丢包），
+    ///   iOS Wi-Fi 省电休眠、路由器丢广播都会让设备"闪断"，表现为一直在线的设备反复掉线上线。
     ///   正常退出走 bye 即时移除，不受此窗口影响；窗口只兜底「异常掉线」。
-    static let lanTtl: TimeInterval = 10
-    static let tsTtl: TimeInterval = 20
+    static let lanTtl: TimeInterval = 25
+    static let tsTtl: TimeInterval = 45
     @Published var progress = ""
     @Published var txActive = false
     @Published var paused = false
@@ -237,9 +238,13 @@ final class Engine: ObservableObject {
         if viaTs { peerTS = src }
 
         let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
-        upsert(id: did, code: code, name: name, platform: platform,
-               src: src, viaLan: viaLan, viaTs: viaTs, peerTSAdvertised: peerTS, port: port)
-        discovery.announceTo(src.isEmpty ? [] : [src])   // 回告报文来源，对方立刻能看到我
+        let isNew = upsert(id: did, code: code, name: name, platform: platform,
+                           src: src, viaLan: viaLan, viaTs: viaTs, peerTSAdvertised: peerTS, port: port)
+        // ★ 只在「第一次看到这台设备 / 它刚从离线回来」时回告一次。
+        //   旧实现是每收一个报文就无条件回告：两台设备会互相对轰到死（A→B→A→B…无节流），
+        //   把自己这条链路的空口和接收缓冲全占满，周期公告反而被丢 —— 于是设备一直在掉线上线。
+        //   现在回告只用于"加速首次互相发现"，稳态完全靠 2s 周期公告，流量骤降。
+        if isNew { discovery.reply(to: src) }
         syncTargets()
     }
 
@@ -260,12 +265,14 @@ final class Engine: ObservableObject {
     ///   - 即时判「对方已关 Tailscale」：LAN 包到达、对方载荷不再带任何 100.x、且近 3s 无 TS 报文
     ///     → 立刻清空 TS 通道（≤2s 内该行消失，只留【局域网】）。
     private func upsert(id: String, code: String, name: String, platform: String,
-                        src: String, viaLan: Bool, viaTs: Bool, peerTSAdvertised: String, port: UInt16) {
+                        src: String, viaLan: Bool, viaTs: Bool, peerTSAdvertised: String, port: UInt16) -> Bool {
         var idx = devices.firstIndex { $0.id == id }
         if idx == nil { idx = devices.firstIndex { $0.code == code } }
         if idx == nil, viaLan { idx = devices.firstIndex { $0.name == name && $0.lanHost == src } }
         let now = Date()
         if let i = idx {
+            // 更新前先记下它原来是不是"活着"，用来判断这次是不是"刚回来"
+            let wasAlive = lanAlive(devices[i]) || tsAlive(devices[i])
             devices[i].id = id.hasPrefix("cf:") ? devices[i].id : id
             devices[i].code = code; devices[i].name = name; devices[i].platform = platform
             devices[i].port = port; devices[i].lastSeen = now
@@ -274,14 +281,16 @@ final class Engine: ObservableObject {
             if viaLan && !viaTs && peerTSAdvertised.isEmpty && now.timeIntervalSince(devices[i].tsSeen) > 3 {
                 devices[i].tsHost = ""; devices[i].tsSeen = .distantPast
             }
+            return !wasAlive
         } else {
             // 两条通道都没被证实（来源既非同网段也非 100.x）→ 不做一条连不通的记录，直接丢弃
-            if !viaLan && !viaTs { return }
+            if !viaLan && !viaTs { return false }
             var d = DeviceInfo(id: id, code: code, name: name, platform: platform,
                                lanHost: "", tsHost: "", port: port, lastSeen: now)
             if viaLan { d.lanHost = src; d.lanSeen = now }
             if viaTs  { d.tsHost  = src; d.tsSeen  = now }
             devices.append(d)
+            return true
         }
     }
 
@@ -347,7 +356,9 @@ final class Engine: ObservableObject {
     func onForeground() {
         appActive = true
         _ = receiver.ensureListening()
-        discovery.announceAll()
+        // ★ v36：回到前台时**重建 UDP 接收 socket**。换 Wi-Fi / 休眠唤醒后，老 socket
+        //   可能一个包都收不到（对端却一切正常）→ 表现为"设备明明在线却看不到"。
+        discovery.resetSockets()
         refreshTailscale()
     }
 
@@ -509,7 +520,7 @@ final class Engine: ObservableObject {
     func preparePhotos(_ results: [PHPickerResult], done: @escaping () -> Void) {
         guard !results.isEmpty else { done(); return }
         let total = results.count
-        DispatchQueue.main.async { self.status = "正在读取 \(total) 项（视频需转码，请稍候）…" }
+        DispatchQueue.main.async { self.status = "正在读取 \(total) 项…" }
 
         // 先在主线程把每项的 (provider, 类型) 解析出来（轻量，不涉 IO）
         var jobs: [(idx: Int, provider: NSItemProvider, typeID: String, isVideo: Bool)] = []

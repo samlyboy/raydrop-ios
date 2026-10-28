@@ -145,9 +145,18 @@ final class RDDiscovery {
     private var sendSock: Int32 = -1
     private var recvSock: Int32 = -1
     private var running = true
+    private var started = false
     /// 收到过报文的来源 IP（用于回发单播），120s 内有效
     private var learned: [String: Date] = [:]
     private let lock = NSLock()
+    /// 最近一次收到任何 RayDrop 报文的时间（判断接收 socket 是否已"哑掉"）
+    private var lastRecv: Date?
+    /// 最近一次收到**局域网**（非 100.x）**真对端**报文的时间（决定要不要启用网段扫描兜底）
+    private var lastLanPeer: Date?
+    /// 回告限速表：同一 IP 最短 2s 才回一次
+    private var lastReply: [String: Date] = [:]
+    /// 请求重建接收 socket（由 recvLoop 在下次超时时消费）
+    private var reopenRequested = false
     /// 上层提供的额外单播目标（发现的设备 IP、CF 目录查到的 IP）
     private var extra: [String] = []
     var onDevice: ([String: Any]) -> Void = { _ in }
@@ -155,6 +164,13 @@ final class RDDiscovery {
     func setExtraTargets(_ ips: [String]) { lock.lock(); extra = ips; lock.unlock() }
 
     func start() {
+        // 幂等：重复调用（如回到前台、重建接收服务后）只补发一轮公告，
+        // 不再新建 socket —— 否则每调一次就漏一个 fd，久了会收不到包。
+        if started {
+            announceAll()
+            return
+        }
+        started = true
         running = true
         sendSock = socket(AF_INET, SOCK_DGRAM, 0)
         var yes: Int32 = 1
@@ -163,7 +179,12 @@ final class RDDiscovery {
         DispatchQueue.global().async { self.recvLoop() }
         DispatchQueue.global().async { self.sweepLoop() }
     }
-    func stop() { running = false; if sendSock >= 0 { close(sendSock) }; if recvSock >= 0 { close(recvSock) } }
+    func stop() {
+        running = false
+        if sendSock >= 0 { close(sendSock); sendSock = -1 }
+        // 接收 socket 交给 recvLoop 自己关（避免这里 close 完、loop 里再 close 造成双重关闭）
+        reopenRecv()
+    }
 
     private func announcement() -> Data? {
         let me: [String: Any] = [
@@ -182,18 +203,58 @@ final class RDDiscovery {
         for (ip, t) in learned where now.timeIntervalSince(t) < 120 { out.append(ip) }
         out.append(contentsOf: extra)
         lock.unlock()
+        // 去掉自己的地址：往自己身上单播纯属浪费（广播本来就会回环到自己）
+        let mine = Set(RDIP.ips())
         var seen = Set<String>()
-        return out.filter { !$0.isEmpty && seen.insert($0).inserted }
+        return out.filter { !$0.isEmpty && !mine.contains($0) && seen.insert($0).inserted }
     }
 
     /// 单播告知指定 IP（广播通道不通时的兜底）
     func announceTo(_ ips: [String]) { for ip in ips { send(to: ip) } }
 
+    /// ★ 回告某个来源地址 —— **必须限速**。
+    ///   旧实现是"每收到一个报文就无条件回一个"：A 回告 B、B 收到又回告 A、A 再回 B……
+    ///   两边在没有任何节流的情况下互相对轰，站口被自己的报文占满，真正的周期公告反而被
+    ///   接收缓冲丢掉 → 对端 10s 收不到就判离线、下一包又复现 → **表现就是设备反复掉线上线**。
+    ///   现在同一 IP 2s 内只回一次，乒乓必然收敛。
+    func reply(to ip: String) {
+        guard !ip.isEmpty else { return }
+        lock.lock()
+        let last = lastReply[ip]
+        let allowed = last == nil || Date().timeIntervalSince(last!) >= 2
+        if allowed { lastReply[ip] = Date() }
+        lock.unlock()
+        if allowed { send(to: ip) }
+    }
+
     /// ★ 立刻对全部已知目标发一轮公告（广播 + 已发现 + tailnet 目标）。
     ///   用于「接收服务重建后」和「回到前台」时，让对端马上刷新本机在线状态。
     func announceAll() {
-        send(to: "255.255.255.255")
+        broadcast()
         for ip in targets() { send(to: ip) }
+    }
+
+    /// 广播：受限广播 + 每个局域网网段的定向广播（x.x.x.255）。
+    /// iOS 上 255.255.255.255 经常被路由器或系统丢掉，定向广播能补上这一路。
+    private func broadcast() {
+        send(to: "255.255.255.255")
+        for ip in RDIP.ips() where !ip.hasPrefix("100.") {
+            let p = ip.split(separator: ".")
+            if p.count == 4 { send(to: "\(p[0]).\(p[1]).\(p[2]).255") }
+        }
+    }
+
+    /// 接收 socket 自愈：置标志，让 recvLoop 在下次超时（≤2s）时跳出重建。
+    /// 换 Wi-Fi、休眠唤醒、被系统回收后，老 socket 可能一个包都收不到（对端却一切正常）。
+    /// （不用 shutdown/close 去打断阻塞：BSD 上不保证能唤醒 recvfrom，还可能双重关闭。）
+    private func reopenRecv() {
+        lock.lock(); reopenRequested = true; lock.unlock()
+    }
+
+    /// 回到前台 / 网络变化后调用：重建接收 socket + 立刻公告一轮
+    func resetSockets() {
+        reopenRecv()
+        announceAll()
     }
 
     private func send(to ip: String) {
@@ -213,71 +274,127 @@ final class RDDiscovery {
     }
 
     private func broadcastLoop() {
+        var tick = 0
         while running {
-            send(to: "255.255.255.255")              // 局域网广播（可能被系统拦下，失败也无所谓）
+            broadcast()                              // 受限广播 + 定向广播
             for ip in targets() { send(to: ip) }     // 单播兜底（含跨 Tailscale 的 100.x 探测）
-            Thread.sleep(forTimeInterval: 2)         // ★ 2s 一轮探测：LAN 通道 4s / TS 通道 6s 无应答即该通道单独消失
+
+            // 接收侧自愈：有应该在线目标、却 45s 一个包都没收到 → 接收 socket 多半已哑（换网/休眠后常见）
+            lock.lock()
+            let idle = lastRecv.map { Date().timeIntervalSince($0) } ?? 0
+            let hasTargets = !extra.isEmpty || !learned.isEmpty
+            lock.unlock()
+            if hasTargets && idle > 45 { reopenRecv() }
+
+            tick += 1
+            if tick % 300 == 0 {   // 每 10 分钟清一次限速表与过期学习记录，防长期膨胀
+                lock.lock()
+                let now = Date()
+                lastReply = lastReply.filter { now.timeIntervalSince($0.value) < 60 }
+                learned = learned.filter { now.timeIntervalSince($0.value) < 600 }
+                lock.unlock()
+            }
+            Thread.sleep(forTimeInterval: 2)         // 2s 一轮公告
         }
     }
 
-    /// 子网探测（兜底）：广播发不出去时（iOS 权限限制 / 路由器丢广播），
-    /// 把同样的告知报文**单播**发给本网段每个 IP —— 对方收到任意 RayDrop 报文都会回告自己。
+    /// 网段扫描（**兜底，默认不跑**）：只有在"局域网里按理该有对端、却 20s 没收到任何局域网报文"时才启用。
+    /// 旧实现**无条件每 5s 对 /24 的 1..254 全量单播**：三台设备就是 150+ 包/秒，
+    /// 叠加每个包都会诱发对端回告，足以把 Wi-Fi 空口占满 —— 周期公告被挤掉，设备就开始疯狂掉线上线。
     private func sweepLoop() {
         while running {
-            var targets: [String] = []
+            Thread.sleep(forTimeInterval: 20)
+            if !running { break }
+            lock.lock()
+            let lanIdle = lastLanPeer.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+            lock.unlock()
+            if lanIdle < 20 { continue }             // 还能收到局域网报文 → 不需要扫
+            var list: [String] = []
             for ip in RDIP.ips() where !ip.hasPrefix("100.") {
                 let parts = ip.split(separator: ".")
                 guard parts.count == 4 else { continue }
-                for h in 1...254 { targets.append("\(parts[0]).\(parts[1]).\(parts[2]).\(h)") }
+                for h in 1...254 { list.append("\(parts[0]).\(parts[1]).\(parts[2]).\(h)") }
             }
-            for ip in targets { send(to: ip) }
-            Thread.sleep(forTimeInterval: 5)      // ★ 5 秒一轮，保证在线设备实时更新（仅本网段兜底）
+            for ip in list {
+                if !running { break }
+                send(to: ip)
+                usleep(8000)                         // 8ms 一个，避免瞬时打爆
+            }
         }
     }
 
     private func recvLoop() {
-        recvSock = socket(AF_INET, SOCK_DGRAM, 0)
-        var yes: Int32 = 1
-        setsockopt(recvSock, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = RD.udpPort.bigEndian
-        addr.sin_addr.s_addr = INADDR_ANY.bigEndian
-        withUnsafePointer(to: &addr) { a in
-            a.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                _ = bind(recvSock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
         var buf = [UInt8](repeating: 0, count: 2048)
         while running {
-            var src = sockaddr_in()
-            var slen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let n = withUnsafeMutablePointer(to: &src) { p -> Int in
-                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    recvfrom(recvSock, &buf, buf.count, 0, sa, &slen)
+            // ★ 每次进来都新建并绑定 socket：被 shutdown/出错后能自动重建
+            let fd = socket(AF_INET, SOCK_DGRAM, 0)
+            guard fd >= 0 else { Thread.sleep(forTimeInterval: 1); continue }
+            var yes: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+            var big: Int32 = 1 << 20                 // 1MB 接收缓冲：扛住突发，避免丢公告
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &big, socklen_t(MemoryLayout<Int32>.size))
+            // 2s 接收超时：让阻塞的 recvfrom 定期返回，好检查「是否该重建 socket / 是否该退出」。
+            // 没有超时的阻塞读会让自愈和优雅退出都做不到。
+            var tv = timeval(tv_sec: 2, tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+            var addr = sockaddr_in()
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = RD.udpPort.bigEndian
+            addr.sin_addr.s_addr = INADDR_ANY.bigEndian
+            withUnsafePointer(to: &addr) { a in
+                a.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    _ = bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
-            guard n > 0 else { continue }
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            _ = withUnsafePointer(to: &src) { p in
-                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    getnameinfo(sa, slen, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            recvSock = fd
+
+            while running {
+                var src = sockaddr_in()
+                var slen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let n = withUnsafeMutablePointer(to: &src) { p -> Int in
+                    p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        recvfrom(fd, &buf, buf.count, 0, sa, &slen)
+                    }
+                }
+                if n <= 0 {
+                    // 区分三种情况：① 收到重建请求 ② 只是 2s 超时（正常）③ 真错误
+                    lock.lock(); let want = reopenRequested; reopenRequested = false; lock.unlock()
+                    if want { break }
+                    if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { continue }
+                    break                            // 真错误 → 跳出重开
+                }
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                _ = withUnsafePointer(to: &src) { p in
+                    p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        getnameinfo(sa, slen, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+                    }
+                }
+                let srcIP = String(cString: host)
+                lock.lock()
+                lastRecv = Date()
+                if !srcIP.isEmpty { learned[srcIP] = Date() }
+                lock.unlock()
+                if let s = String(bytes: buf[0..<n], encoding: .utf8),
+                   let data = s.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let app = obj["app"] as? String, app == RD.app,
+                   let code = obj["code"] as? String, code != RDStore.shared.myCode,
+                   // ★ 再按设备 UUID 过滤一次自己（防止码不同步时自己出现在列表里）
+                   (obj["did"] as? String).map({ $0 != RDStore.shared.deviceId }) ?? true {
+                    // 只有"真对端"的局域网报文才算局域网活着（自己广播的回环不算）
+                    if !srcIP.isEmpty && !srcIP.hasPrefix("100.") {
+                        lock.lock(); lastLanPeer = Date(); lock.unlock()
+                    }
+                    var o = obj
+                    o["srcIP"] = srcIP
+                    DispatchQueue.main.async { self.onDevice(o) }
                 }
             }
-            let srcIP = String(cString: host)
-            if !srcIP.isEmpty { lock.lock(); learned[srcIP] = Date(); lock.unlock() }
-            if let s = String(bytes: buf[0..<n], encoding: .utf8),
-               let data = s.data(using: .utf8),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let app = obj["app"] as? String, app == RD.app,
-               let code = obj["code"] as? String, code != RDStore.shared.myCode,
-               // ★ 再按设备 UUID 过滤一次自己（防止码不同步时自己出现在列表里）
-               (obj["did"] as? String).map({ $0 != RDStore.shared.deviceId }) ?? true {
-                var o = obj
-                o["srcIP"] = srcIP
-                DispatchQueue.main.async { self.onDevice(o) }
-            }
+            // 内层退出：关掉本轮 socket，1s 后重建（换网/被系统回收后 socket 会彻底哑掉）
+            if recvSock == fd { recvSock = -1 }
+            close(fd)
+            if running { Thread.sleep(forTimeInterval: 1) }
         }
     }
 }
