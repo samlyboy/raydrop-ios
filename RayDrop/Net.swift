@@ -443,9 +443,10 @@ final class RDReceiver {
             //   iOS 把 App 挂起 / 抢占后，旧监听的内核 socket 可能还占着 41235，
             //   不允许复用时新监听会一直停在 .waiting(POSIX 48 EADDRINUSE)，
             //   永远到不了 .ready → 巡检又判定"没就绪"→ 再重建 → 无限空转、日志刷屏。
-            let params = NWParameters.tcp
+            let tcpOpts = NWProtocolTCP.Options()
+            tcpOpts.noDelay = true                     // 小文件/握手包别等 Nagle 攒包
+            let params = NWParameters(tls: nil, tcp: tcpOpts)
             params.allowLocalEndpointReuse = true
-            params.noDelay = true
             let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: RD.tcpPort)!)
             l.newConnectionHandler = { (conn: NWConnection) in
                 conn.start(queue: DispatchQueue.global())
