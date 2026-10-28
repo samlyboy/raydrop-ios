@@ -76,6 +76,19 @@ extension RD {
         let e = ext(forMime: mime)
         return e.isEmpty ? name : name + "." + e
     }
+
+    /// ★ 修正"视频只落在「下载」、进不了相册"的第二半：接收端写相册前若发现
+    ///   mime 是 application/octet-stream（老版本对端不认识该后缀），用扩展名反推真实 mime，
+    ///   让 `RDMediaSaver` 能按视频写入。返回修好的 mime。
+    static func correctedMime(name: String, mime: String) -> String {
+        let m = mime.lowercased()
+        // 已经能判出是媒体类型 → 直接用
+        if m.hasPrefix("video/") || m.hasPrefix("image/") { return mime }
+        let guessed = RD.mime(for: name)
+        // 扩展名推出了媒体类型 → 采用；否则保持原值（如 .zip/.pdf 仍是 octet-stream 也无所谓）
+        if guessed.hasPrefix("video/") || guessed.hasPrefix("image/") { return guessed }
+        return mime
+    }
 }
 
 /// 枚举本机 IP。**根治"幽灵 IP"**：只上报当前 Wi-Fi 主接口(en0)的局域网地址 + Tailscale(100.x)。
@@ -278,6 +291,8 @@ final class RDReceiver {
     var onStart: (String, Int) -> Void = { _, _ in }                    // 对端名, 文件总数
     var onProgress: (Int, Int, Int64, Int64, Double) -> Void = { _, _, _, _, _ in }  // 第几个(1起), 总数, 已收字节, 文件总大小, 字节/秒
     var onEnd: (Bool, String) -> Void = { _, _ in }
+    /// 有媒体文件已落「下载」但没进相册时回调（参数为汇总说明），供上层写日志提醒
+    var onAlbumNote: (String) -> Void = { _ in }
     var onText: (String, String) -> Void = { _, _ in }                       // 收到文本消息(来自, 文本)
     private var listener: NWListener?
     private var current: RDStream?
@@ -347,6 +362,8 @@ final class RDReceiver {
     private func handle(_ s: RDStream) async {
         var total = 0
         var saveFailed = false
+        /// 已落「下载」但写相册失败的媒体文件（视频居多）；结束时汇总报出，避免"以为没收到"
+        var albumFailed: [String] = []
         defer { s.close(); if current === s { current = nil } }
         do {
             let hsLine = try await s.readLine()
@@ -367,10 +384,28 @@ final class RDReceiver {
                 // 发送端为排序加的 "%03d_" 序号前缀要去掉，接收方文件名与发送端原名保持一致
                 let rawName = fh["name"] as? String ?? "file\(i)"
                 let size = fh["size"] as? Int ?? 0
-                let mime = fh["mime"] as? String ?? RD.mime(for: rawName)
+                let rawMime = fh["mime"] as? String ?? RD.mime(for: rawName)
                 let kind = fh["kind"] as? String ?? "file"
                 // 文件名：去排序前缀 → 消毒（防目录穿越）→ 缺扩展名时按 mime 补上（让「文件」App 能预览）
-                let name = RD.ensureExt(RD.sanitize(RD.stripUUIDPrefix(RD.stripOrderPrefix(rawName))), mime: mime)
+                let name = RD.ensureExt(RD.sanitize(RD.stripUUIDPrefix(RD.stripOrderPrefix(rawName))), mime: rawMime)
+                // ★ mime 修正：老版本对端/怪后缀会把视频标成 application/octet-stream，
+                //   这里按扩展名反推回 video/*，否则会被当作非媒体 → 只落「下载」不进相册。
+                let mime = RD.correctedMime(name: name, mime: rawMime)
+
+                // ★ 长度校验：单文件上限 8GB，且不超过磁盘可用空间。
+                //   异常对端可声明超大 size 写满磁盘 —— 这是协议级错误，无法安全跳过
+                //   （丢掉多少字节都不可信），直接终止本次会话，避免错位后连锁出错。
+                if size < 0 || size > RD.maxFileSize {
+                    saveFailed = true
+                    onStatus("接收终止：\(name) 声明大小 \(size) 非法")
+                    throw RDStream.ReadError.closed
+                }
+                let free = RD.freeDiskSpace()
+                if size > free {
+                    saveFailed = true
+                    onStatus("接收终止：空间不足，\(name) 需要 \(size / 1048576)MB，可用 \(free / 1048576)MB")
+                    throw RDStream.ReadError.closed
+                }
 
                 if kind == "text" {
                     // 文本消息：读 size 字节到内存，回调上层弹窗展示（不落盘）
@@ -381,7 +416,13 @@ final class RDReceiver {
                     continue
                 }
 
-                let isMedia = mime.hasPrefix("image/") || mime.hasPrefix("video/")
+                if kind == "skip" {
+                    // 发送端自己读不了该项（文件已失效）→ 只占位，不落盘、不计失败
+                    RDWrite.line(s.conn, ["ack": i])
+                    continue
+                }
+
+                let isMedia = RD.isImageFile(name: name, mime: mime) || RD.isVideoFile(name: name, mime: mime)
                 let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("rd_\(UUID().uuidString)")
                 FileManager.default.createFile(atPath: tmp.path, contents: nil)
                 let handle = try FileHandle(forWritingTo: tmp)
@@ -424,14 +465,28 @@ final class RDReceiver {
                             cont.resume(returning: (ok, err))
                         }
                     }
-                    if !res.0 { onStatus("已存「下载」，但写入相册失败：\(name)（\(res.1)）") }
+                    if res.0 {
+                        onStatus("已存相册：\(name)")
+                    } else {
+                        // ★ 视频写相册失败是最容易被误认为"没收到"的：文件其实在「下载」里，
+                        //   但用户在相册里找不到。必须把原因连文件名一起报出来，别只说"写入相册失败"。
+                        albumFailed.append("\(name)（\(res.1)）")
+                        onStatus("已存「下载」，但写入相册失败：\(name)（\(res.1)）")
+                    }
                 }
                 if saved { onSaved(fromName, name, dst.path) }
                 RDWrite.line(s.conn, ack)   // 收完才放行下一个
             }
             _ = try? await s.readLine()   // done
             RDWrite.line(s.conn, ["ok": true, "bye": true])
-            onStatus(saveFailed ? "接收结束（部分文件未保存）" : "接收完成：\(fromName)")
+            if !albumFailed.isEmpty {
+                // ★ 汇总：文件都在「下载」里（真收到了），只是没进相册。这句必须说清楚，
+                //   否则用户看到相册没有视频，会以为传输失败。
+                onStatus("接收完成：\(fromName)。\(albumFailed.count) 项已存「下载」但未进相册")
+                onAlbumNote(albumFailed.joined(separator: "；"))
+            } else {
+                onStatus(saveFailed ? "接收结束（部分文件未保存）" : "接收完成：\(fromName)")
+            }
             onEnd(!saveFailed, saveFailed ? "部分文件保存失败" : "接收完成")
         } catch {
             if aborted { onStatus("已终止"); onEnd(false, "已终止") }
@@ -467,12 +522,38 @@ final class RDSender {
 
     func send(host: String, port: UInt16, peerName: String, items: [SendItem], done: @escaping (Bool) -> Void) {
         aborted = false; paused = false; finished = false
+
+        // ★ 发前预校验：逐项确认文件真实可读、大小 > 0。
+        //   旧实现把 `try FileHandle(forReadingFrom:)` 放在循环里抛，**任意一项打不开就整批中断** ——
+        //   混合发送时若某个视频取不到（临时文件被系统清理/权限问题），后面的项全发不出去，
+        //   表现也像"只收到前面几张照片"。这里提前剔除坏项并告知，剩下的照常发。
+        var checked: [SendItem] = []
+        var skipped: [String] = []
+        for it in items {
+            switch it {
+            case .text(let t):
+                if t.isEmpty { continue }
+                checked.append(it)
+            case .file(let url):
+                let fm = FileManager.default
+                guard fm.fileExists(atPath: url.path) else { skipped.append(url.lastPathComponent); continue }
+                let sz = ((try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                guard sz > 0 else { skipped.append(url.lastPathComponent); continue }
+                guard fm.isReadableFile(atPath: url.path) else { skipped.append(url.lastPathComponent); continue }
+                checked.append(it)
+            }
+        }
+        if !skipped.isEmpty {
+            onStatus("有 \(skipped.count) 项无法读取，已跳过：\(skipped.joined(separator: "、"))")
+        }
+        guard !checked.isEmpty else { stop("没有可发送的内容（文件均已失效）", done); return }
+
         let nw = NWEndpoint.Host(host)
         let p = NWEndpoint.Port(rawValue: port)!
         let c = NWConnection(host: nw, port: p, using: .tcp)
         conn = c
         c.stateUpdateHandler = { (st: NWConnection.State) in
-            if case .ready = st { self.doSend(peer: peerName, items: items, done: done) }
+            if case .ready = st { self.doSend(peer: peerName, items: checked, done: done) }
             else if case .failed = st { if self.aborted { self.stop("已终止", done) } else { self.stop("连接失败", done) } }
             else if case .cancelled = st { if self.aborted && !self.finished { self.stop("已终止", done) } }
         }
@@ -505,9 +586,19 @@ final class RDSender {
                         name = String(format: "%03d_", i + 1) + url.lastPathComponent
                         mime = RD.mime(for: url.lastPathComponent)
                         kind = "file"
-                        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-                        size = (attrs[.size] as? Int) ?? 0
-                        handle = try FileHandle(forReadingFrom: url)
+                        // ★ 单项打不开不能中断整批（否则"照片发完了、视频和后面的全没了"）。
+                        //   发一个 kind=skip 的空条目占位，协议计数保持对齐，接收端跳过不落盘。
+                        guard let h = try? FileHandle(forReadingFrom: url),
+                              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                              let sz64 = (attrs[.size] as? NSNumber)?.int64Value else {
+                            self.onStatus("跳过（无法读取）：\(url.lastPathComponent)")
+                            RDWrite.lenJSON(conn!, ["name": name, "size": 0, "mime": mime,
+                                                    "kind": "skip", "index": i, "total": items.count])
+                            _ = try? await s.readLine()      // 等对方 ACK，保持对齐
+                            continue
+                        }
+                        size = Int(sz64)
+                        handle = h
                     case .text(let str):
                         name = String(format: "%03d_", i + 1) + "文本消息.txt"
                         mime = "text/plain;charset=utf-8"
@@ -517,6 +608,7 @@ final class RDSender {
                     }
                     RDWrite.lenJSON(conn!, ["name": name, "size": size, "mime": mime, "kind": kind, "index": i, "total": items.count])
                     var off = 0, lastTick = Date(), lastB = 0, spd = 0.0
+                    var shortRead = false
                     while off < size {
                         await self.waitIfPaused()
                         if self.aborted { try? handle?.close(); self.stop("已终止", done); s.close(); return }
@@ -524,7 +616,11 @@ final class RDSender {
                         let chunk: Data
                         if let h = handle { chunk = h.readData(ofLength: want) }
                         else { chunk = textData!.subdata(in: off..<(off + want)) }
-                        if chunk.isEmpty { break }
+                        // ★ 读不到预期字节 = 文件在传输中被截断/删除。旧代码直接 `break`，
+                        //   结果「声明了 N 字节、实际发了 M<N 字节」，接收端 readIntoFile 会永远
+                        //   阻塞等剩下的字节（它不知道发送端已经放弃）→ 整条传输卡死、后续文件全丢。
+                        //   现在必须让错误可见：关连接，让接收端读到 closed 并结束本次接收。
+                        if chunk.isEmpty { shortRead = true; break }
                         try await self.sendChunk(chunk)   // 背压：等这块发完再发下一块
                         off += chunk.count
                         let now = Date(); let dt = now.timeIntervalSince(lastTick)
@@ -535,11 +631,17 @@ final class RDSender {
                         }
                     }
                     try? handle?.close()
+                    if shortRead {
+                        self.stop("发送中断：\(name) 只读到 \(off)/\(size) 字节（文件可能被系统清理或损坏）", done)
+                        s.close(); return
+                    }
                     let ackLine = try await s.readLine()   // ACK：收完才发下一个
                     if let d = ackLine.data(using: .utf8),
                        let a = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
                        let e = a["err"] as? String {
-                        self.stop("对方保存失败：\(e)", done); s.close(); return
+                        // ★ 对方保存失败只跳过这一项，不再整批中断（旧行为会让后续文件全丢）
+                        self.onStatus("对方未能保存 \(name)：\(e)")
+                        continue
                     }
                     self.onStatus("已发送 \(name)")
                 }
