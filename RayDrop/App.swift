@@ -166,7 +166,17 @@ final class Engine: ObservableObject {
 
     func start() {
         if didStart { return }; didStart = true
-        receiver.onStatus = { [weak self] s in DispatchQueue.main.async { self?.status = s } }
+        receiver.onStatus = { [weak self] s in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.status = s
+                // ★ v40：监听起不来时，把**真实原因**也写进日志（不是只说"正在重建"）。
+                //   去重由 RDReceiver 侧保证（同一句只报一次），不会刷屏。
+                if s.hasPrefix("接收服务等待中") || s.hasPrefix("接收服务失败") || s.hasPrefix("接收端口错误") {
+                    self.addLog(s)
+                }
+            }
+        }
         // ★ 监听就绪（含被系统挂起后的自动重建）→ 立刻公告一轮，让对端马上刷新本机在线状态
         //   回调来自监听的串行队列，转回主线程再动 UI 状态
         receiver.onListening = { [weak self] in DispatchQueue.main.async { self?.onReceiverReady() } }
