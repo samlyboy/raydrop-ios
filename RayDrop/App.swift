@@ -85,6 +85,17 @@ final class Engine: ObservableObject {
     private var didStart = false
     /// 跨 Tailscale 发现：从 Tailscale API 拉到的 tailnet 设备 100.x（非本机），作为单播探测目标
     private var tsTargets: [String] = []
+    /// ★ v47.2：上次见过 / 连过的对端地址（持久化，最多 8 个）。
+    ///
+    ///   冷启动时 `devices` 是空的，这时**只能等对端每 2s 一轮的广播**；而 iOS 的 UDP 广播在
+    ///   省电、路由器丢广播、刚连上 Wi-Fi 时经常要好几秒才通 —— 实测出现过 10s 空窗，
+    ///   分享面板上就是「一直显示未发现设备」。把这些地址记住，启动后立刻**单播敲门**，
+    ///   对端一收到就回告，设备列表亚秒级就能出来，不用等广播。
+    private var savedPeers: [String] = UserDefaults.standard.stringArray(forKey: Engine.peersKey) ?? []
+    static let peersKey = "rd.savedPeers"
+    /// App 启动时刻，仅用于日志里报「启动后多少秒发现第一台设备」，便于日后判断发现链路是否变慢
+    private var beganAt = Date()
+    private var loggedFirstDiscovery = false
 
     static let cIn = Color(red: 0.90, green: 0.22, blue: 0.21)
     static let cOut = Color(red: 0.18, green: 0.60, blue: 0.24)
@@ -181,6 +192,7 @@ final class Engine: ObservableObject {
 
     func start() {
         if didStart { return }; didStart = true
+        beganAt = Date()
         // ★ v46：后台空闲自动退出。这里只注入「忙不忙」的判定，计时与退出交给 RDIdleExit。
         //   三个标记都要算：txActive（正在传）、sendingToID（点下去到握手完成之间，常几秒到十几秒）、
         //   preparing（选完素材还在导出/复制，此时被杀会白等一场）。
@@ -252,6 +264,9 @@ final class Engine: ObservableObject {
         }
         addLog("接收到的文件会自动存入「下载」文件夹（文件 App → 我的 iPhone → RayDrop锐传 → 下载），无需手动确认；图片/视频另存一份到相册。")
         receiver.start(); discovery.start()
+        // ★ v47.2：把「上次见过的对端」立刻塞进单播目标。
+        //   冷启动时 devices 为空，若只靠广播，遇到路由器丢广播 / Wi-Fi 省电要等 10s 才出现设备。
+        syncTargets()
         // ★ 1s 一轮巡检：通道断开（LAN 10s / TS 20s）与整机离线都能在 1s 内反映到界面；
         //   同时每 5s 做一次「接收监听健康检查」——NWListener 被系统压成 waiting/failed 后不会自愈，
         //   不重建就会「对端显示本机在线，却一发就 ECONNREFUSED」。
@@ -300,6 +315,12 @@ final class Engine: ObservableObject {
         //   把自己这条链路的空口和接收缓冲全占满，周期公告反而被丢 —— 于是设备一直在掉线上线。
         //   现在回告只用于"加速首次互相发现"，稳态完全靠 2s 周期公告，流量骤降。
         if isNew { discovery.reply(to: src) }
+        // ★ v47.2：把对端地址记下来，下次冷启动直接单播敲门，不必干等对端广播
+        rememberPeer(src)
+        if !loggedFirstDiscovery, devices.contains(where: { lanAlive($0) || tsAlive($0) }) {
+            loggedFirstDiscovery = true
+            addLog("发现设备（启动后 \(String(format: "%.1f", Date().timeIntervalSince(beganAt))) 秒）")
+        }
         syncTargets()
     }
 
@@ -362,7 +383,19 @@ final class Engine: ObservableObject {
         var all: [String] = []
         for d in devices { if !d.lanHost.isEmpty { all.append(d.lanHost) }; if !d.tsHost.isEmpty { all.append(d.tsHost) } }
         all.append(contentsOf: tsTargets)   // 跨 Tailscale 拉到的 tailnet 设备 100.x 也作为单播探测目标
+        all.append(contentsOf: savedPeers)  // ★ v47.2：上次见过的对端，冷启动时唯一的敲门目标
         discovery.setExtraTargets(all)
+    }
+
+    /// 记住对端地址（供下次冷启动单播敲门）。最多留 8 个，最近用过的排最后。
+    private func rememberPeer(_ ip: String) {
+        guard !ip.isEmpty, !ip.hasPrefix("169.254.") else { return }
+        // 自己的地址不必记：targets() 会过滤，但记进去纯属浪费槽位
+        guard !RDIP.ips().contains(ip) else { return }
+        if savedPeers.contains(ip) { return }
+        savedPeers.append(ip)
+        if savedPeers.count > 8 { savedPeers.removeFirst(savedPeers.count - 8) }
+        UserDefaults.standard.set(savedPeers, forKey: Engine.peersKey)
     }
 
     /// 用内嵌 OAuth client 拉取 tailnet 设备的 100.x，仅刷新「单播探测目标」。
@@ -442,6 +475,33 @@ final class Engine: ObservableObject {
         }
         lastListenPort = port
         discovery.announceAll()
+        // ★ v47.2：端口就绪的这一瞬间就对「上次见过的对端」连发几次单播。
+        //   广播包在端口就绪前是被丢掉的（announcement() 端口为 0 返回 nil，防对端拿到 port:0），
+        //   所以这一刻才是真正能发出去的第一个时机 —— 越早敲，设备列表出来得越快。
+        if !savedPeers.isEmpty { burstAnnounce(savedPeers) }
+    }
+
+    /// ★ v47.2：分享面板打开时调 —— 面板是「马上就要选设备」的场景，值得密集找一轮。
+    ///   持续 `seconds` 秒、每 0.5s 发一次广播 + 单播（含上次见过的对端），不读 devices，
+    ///   所以可以从后台队列安全地跑。
+    func kickDiscovery(seconds: Double = 8) {
+        syncTargets()
+        DispatchQueue.global().async { [weak self] in
+            guard let self else { return }
+            let end = Date().addingTimeInterval(seconds)
+            while Date() < end {
+                self.discovery.announceAll()
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+        }
+        // 8 秒还一台都没有 → 请发现层扫一遍整个网段。
+        // 只靠广播时，一旦路由器把 UDP 广播吞了，等多久都不会出现设备；这条是最后保险。
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self else { return }
+            guard !self.devices.contains(where: { self.lanAlive($0) || self.tsAlive($0) }) else { return }
+            self.discovery.requestSweep()
+            self.addLog("仍未发现设备，正在扫描局域网…")
+        }
     }
 
     /// 定期巡检（1s 一轮，及时反映上下线）：
@@ -1422,7 +1482,12 @@ struct ContentView: View {
         }
         .sheet(isPresented: $engine.showSharePrompt) { ShareInboxSheet(engine: engine) }
         .onReceive(NotificationCenter.default.publisher(for: .rdAppShouldScanInbox)) { _ in engine.consumeSharedItems() }
-        .onAppear { engine.appActive = (scenePhase == .active); engine.start(); engine.consumeSharedItems() }
+        .onAppear {
+            engine.appActive = (scenePhase == .active); engine.start(); engine.consumeSharedItems()
+            // ★ v47.2：进主界面就先密集找一轮（含「上次见过的对端」单播），
+            //   不要干等对端每 2s 一轮的广播 —— 那一轮在路由器丢广播时要好几秒。
+            engine.kickDiscovery(seconds: 4)
+        }
         .onChange(of: scenePhase) { phase in
             // ★ 回到前台：确认接收监听可用 + 立刻公告一轮，修正「对端显示在线却发不进来」
             engine.appActive = (phase == .active)
@@ -1481,7 +1546,7 @@ struct ContentView: View {
                 let lan = engine.devices.filter { engine.lanAlive($0) }
                 let ts = engine.devices.filter { engine.tsAlive($0) }
                 if lan.isEmpty && ts.isEmpty {
-                    Text("未发现设备，等待广播/探测…").foregroundColor(.gray).font(.footnote).padding(.horizontal)
+                    Text("正在查找设备…").foregroundColor(.gray).font(.footnote).padding(.horizontal)
                 } else {
                     if !lan.isEmpty {
                         Text("【局域网】").font(.caption2).foregroundColor(.secondary).padding(.horizontal)
@@ -1647,6 +1712,11 @@ struct ShareInboxSheet: View {
         aliveRows.count == 1 ? aliveRows[0] : nil
     }
 
+    /// 面板打开的时刻 —— 用来在「还没找到设备」时显示已经搜了几秒。
+    /// ★ v47.1 之前这里只写「未发现设备…」，冷启动那几秒空窗看着像坏了；
+    ///   现在明确写「正在查找」并给秒数，用户知道它还在找，不会以为出故障。
+    @State private var shownAt = Date()
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
@@ -1691,7 +1761,20 @@ struct ShareInboxSheet: View {
                     .buttonStyle(.borderedProminent)
                     .padding(.horizontal).padding(.vertical, 10)
                 } else if aliveRows.isEmpty {
-                    Text("未发现设备…").foregroundColor(.gray).padding(12)
+                    // ★ v47.2：冷启动时设备要几秒才出来，这里明确告诉用户「还在找、搜了几秒」，
+                    //   而不是一句「未发现设备」让人以为坏了（v47.1 的措辞就是这个毛病）。
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("正在查找设备…").font(.subheadline).foregroundColor(.secondary)
+                        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                            Text(searchHint(now: ctx.date))
+                                .font(.caption2).foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 18)
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 18)
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 2) {
@@ -1712,6 +1795,18 @@ struct ShareInboxSheet: View {
             .navigationTitle("分享到 RayDrop").navigationBarTitleDisplayMode(.inline)
         }
         .navigationViewStyle(.stack)
+        .onAppear {
+            shownAt = Date()
+            // 面板出现 = 马上就要选设备，值得密集找一轮（默认每 0.5s 一次、共 8 秒）
+            engine.kickDiscovery()
+        }
+    }
+
+    /// 「还在找设备」那行提示：带上已等待秒数，超过 8 秒才补一句排查建议。
+    private func searchHint(now: Date) -> String {
+        let s = max(0, Int(now.timeIntervalSince(shownAt)))
+        if s < 8 { return "已搜索 \(s) 秒" }
+        return "已搜索 \(s) 秒 · 请确认对端已打开 RayDrop，且与本机连同一个 Wi-Fi"
     }
 
     private func devBtn(_ d: Engine.DeviceInfo, _ host: String) -> some View {

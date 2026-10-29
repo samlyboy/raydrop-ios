@@ -157,6 +157,9 @@ final class RDDiscovery {
     private var lastReply: [String: Date] = [:]
     /// 请求重建接收 socket（由 recvLoop 在下次超时时消费）
     private var reopenRequested = false
+    /// ★ v47.2：请求**立刻**做一次网段扫描（由 sweepLoop 消费）。
+    ///   有些路由器会直接吞掉 UDP 广播，此时只能靠逐个单播把对端敲出来 —— 254 个包约 2s 扫完。
+    private var sweepRequested = false
     /// 上层提供的额外单播目标（发现的设备 IP、CF 目录查到的 IP）
     private var extra: [String] = []
     var onDevice: ([String: Any]) -> Void = { _ in }
@@ -273,6 +276,12 @@ final class RDDiscovery {
         announceAll()
     }
 
+    /// ★ v47.2：点名要一次网段扫描（下一个 0.5s 心跳就执行）。
+    ///   广播被路由器吞掉、或对端不响应广播时，这是最后手段 —— 254 个单播约 2s 扫完。
+    func requestSweep() {
+        lock.lock(); sweepRequested = true; lock.unlock()
+    }
+
     private func send(to ip: String) {
         guard sendSock >= 0, let data = announcement() else { return }
         var addr = sockaddr_in()
@@ -318,13 +327,19 @@ final class RDDiscovery {
     /// 旧实现**无条件每 5s 对 /24 的 1..254 全量单播**：三台设备就是 150+ 包/秒，
     /// 叠加每个包都会诱发对端回告，足以把 Wi-Fi 空口占满 —— 周期公告被挤掉，设备就开始疯狂掉线上线。
     private func sweepLoop() {
+        var nextAuto = Date().addingTimeInterval(20)
         while running {
-            Thread.sleep(forTimeInterval: 20)
+            Thread.sleep(forTimeInterval: 0.5)
             if !running { break }
             lock.lock()
+            let wanted = sweepRequested; sweepRequested = false
             let lanIdle = lastLanPeer.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
             lock.unlock()
-            if lanIdle < 20 { continue }             // 还能收到局域网报文 → 不需要扫
+            let due = Date() >= nextAuto
+            if !wanted && !due { continue }
+            // 自动那一轮只在「一个局域网包都收不到」时才扫；被上层点名要的（面板等不到设备）无条件扫
+            if !wanted, lanIdle < 20 { nextAuto = Date().addingTimeInterval(20); continue }
+            nextAuto = Date().addingTimeInterval(20)
             var list: [String] = []
             for ip in RDIP.ips() where !ip.hasPrefix("100.") {
                 let parts = ip.split(separator: ".")
