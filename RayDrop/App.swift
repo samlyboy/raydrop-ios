@@ -1626,12 +1626,25 @@ struct ShareInboxSheet: View {
     @ObservedObject var engine: Engine
     @Environment(\.dismiss) private var dismiss
 
-    /// ★ v47：只有一台设备在线时返回它（连同可用的主机地址）；0 台或多台返回 nil。
-    ///   多台时不给大按钮 —— 猜错对象就把私密照片发错人了。
-    private var onlyAliveDevice: (Engine.DeviceInfo, String)? {
-        let alive = engine.devices.filter { engine.lanAlive($0) || engine.tsAlive($0) }
-        guard alive.count == 1, let d = alive.first else { return nil }
-        return (d, engine.lanAlive(d) ? d.lanHost : d.tsHost)
+    /// ★ v47：可点的设备行。**一台设备只出一行**——局域网也通、Tailscale 也通时优先局域网
+    ///   （同网段直连最快），否则会把同一台机器在列表里列出两次，看着像两台设备。
+    private struct AliveRow: Identifiable {
+        let dev: Engine.DeviceInfo
+        let host: String
+        var id: String { dev.id }
+    }
+
+    private var aliveRows: [AliveRow] {
+        engine.devices.compactMap { d -> AliveRow? in
+            if engine.lanAlive(d) { return AliveRow(dev: d, host: d.lanHost) }
+            if engine.tsAlive(d) { return AliveRow(dev: d, host: d.tsHost) }
+            return nil
+        }
+    }
+
+    /// 只有一台设备在线时返回它；0 台或多台返回 nil（多台不给大按钮，防发错人）
+    private var onlyAliveDevice: AliveRow? {
+        aliveRows.count == 1 ? aliveRows[0] : nil
     }
 
     var body: some View {
@@ -1657,29 +1670,32 @@ struct ShareInboxSheet: View {
                     }
                 }
                 Divider()
-                // ★ v47：只发现一台设备时给一个大按钮，省得在列表里找
+                // ★ v47：只有一台设备时给一个大按钮，并**不再重复列一遍**。
+                //   v47.0 犯过这个错：按钮 + 列表各显示同一台，看着像两台设备。
                 if let one = onlyAliveDevice {
                     Button {
-                        engine.sendShared(to: one.0, host: one.1)
+                        engine.sendShared(to: one.dev, host: one.host)
                     } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: one.0.isComputer ? "desktopcomputer" : "iphone")
-                            Text("发给 \(one.0.name)").fontWeight(.semibold)
+                        HStack(spacing: 10) {
+                            Image(systemName: one.dev.isComputer ? "desktopcomputer" : "iphone").font(.title3)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("发给 \(one.dev.name)").fontWeight(.semibold)
+                                Text(one.host).font(.caption2).opacity(0.85)
+                            }
                             Spacer()
-                            Image(systemName: "arrow.up.circle.fill")
+                            Image(systemName: "arrow.up.circle.fill").font(.title3)
                         }
                         .frame(maxWidth: .infinity)
+                        .padding(.vertical, 4)
                     }
                     .buttonStyle(.borderedProminent)
-                    .padding(.horizontal).padding(.top, 10)
-                }
-                if engine.devices.isEmpty {
+                    .padding(.horizontal).padding(.vertical, 10)
+                } else if aliveRows.isEmpty {
                     Text("未发现设备…").foregroundColor(.gray).padding(12)
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 2) {
-                            ForEach(engine.devices.filter { engine.lanAlive($0) }) { d in devBtn(d, d.lanHost) }
-                            ForEach(engine.devices.filter { engine.tsAlive($0) }) { d in devBtn(d, d.tsHost) }
+                            ForEach(aliveRows) { row in devBtn(row.dev, row.host) }
                         }
                         .padding(.horizontal).padding(.vertical, 6)
                     }
