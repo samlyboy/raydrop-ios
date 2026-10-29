@@ -1,15 +1,28 @@
 import Foundation
 import UIKit
 import UniformTypeIdentifiers
+import UserNotifications
 
-/// 分享扩展：把相册/文件/文本暂存到 App Group 的 inbox 目录，然后唤起主 APP 选设备发送。
-/// 主 APP 的 consumeSharedItems() 会读取这里。
+/// 分享扩展：把相册/文件/文本暂存到 App Group 的 inbox 目录，然后把主 APP 拉到前台。
+/// 主 APP 的 consumeSharedItems() 会读取这里，弹出「分享到 RayDrop」面板（文件已列好，点设备即发）。
+///
+/// ★ 为什么要「拉」而不是「等」：iOS 没给分享扩展任何官方手段切到宿主 APP。
+///   扩展只能 completeRequest，之后系统把用户送回**发起分享的 App**（也就是相册），
+///   这正是「分享完还得自己去桌面点图标」的根因。
+///   v47 起走两条非官方路径（TrollStore 侧载，不走商店审核）：
+///     ① 沿响应链找到 UIApplication，调它的 openURL:（老接口，实测最有效）
+///     ② extensionContext.open(url) —— 官方接口，但分享扩展基本被忽略，留作兜底
+///   两条都指望不上时：落下一条 5 秒后的本地通知。主 APP 成功起来会立刻撤掉它，
+///   所以正常情况下用户永远看不到这条通知；只有跳转失败它才浮现，点一下照样能进到面板。
 final class ShareViewController: UIViewController
 {
     private let appGroupID = "group.com.raydrop.ios"
+    /// 与主 APP 里 RDShareNotify.readyID 必须一致；主 APP 靠这个 id 撤销通知
+    private let readyNotificationID = "rd_share_ready"
     private var statusLabel: UILabel!
 
-    override func viewDidLoad() {
+    override func viewDidLoad()
+    {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         setupUI()
@@ -30,6 +43,8 @@ final class ShareViewController: UIViewController
         statusLabel = UILabel(); statusLabel.text = "正在准备…"
         statusLabel.font = .preferredFont(forTextStyle: .subheadline)
         statusLabel.textColor = .secondaryLabel
+        statusLabel.numberOfLines = 0
+        statusLabel.textAlignment = .center
         let cancel = UIButton(type: .system); cancel.setTitle("取消", for: .normal)
         cancel.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
         v.addArrangedSubview(icon); v.addArrangedSubview(statusLabel); v.addArrangedSubview(cancel)
@@ -37,6 +52,8 @@ final class ShareViewController: UIViewController
         NSLayoutConstraint.activate([
             v.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             v.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            v.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
+            v.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
         ])
     }
 
@@ -151,28 +168,98 @@ final class ShareViewController: UIViewController
             }
             return
         }
-        statusLabel.text = "已准备 \(count) 项，正在打开 RayDrop…"
-        // 扩展里禁止 UIApplication.shared，但 NSExtensionContext.open 是允许的：
-        // 它会直接跳到主 APP（而不是让用户手动切出去再找）。
-        // 同时用 Darwin 通知兜底，保证主 APP 在后台时也能被唤醒扫描 inbox。
+
+        // 先告诉主 APP「inbox 有新东西」：它若本来就在后台跑着，这条通知能让它立刻去扫；
+        // 万一跳转失败、用户过一会儿自己点开 App，内容也已经就绪。
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),
             CFNotificationName("com.raydrop.ios.sharedItemsAdded" as CFString),
             nil, nil, true)
 
-        if let ctx = extensionContext, let url = URL(string: "raydrop://shared")
+        let route = jumpToHostApp()
+        statusLabel.text = "已准备 \(count) 项，正在打开 RayDrop…"
+        writeDiag(route: route, count: count)
+        scheduleReadyNotification(count)
+
+        // 留 0.35s 让跳转指令生效，再收掉分享面板（顺序反了会被系统把跳转吞掉）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+        }
+    }
+
+    // MARK: - 拉起主 APP（v47）
+
+    /// 依次尝试两条路径，返回实际用上的那条（写进诊断文件，主 APP 会打进日志）
+    private func jumpToHostApp() -> String
+    {
+        guard let url = URL(string: "raydrop://shared") else { return "bad-url" }
+        var route = "none"
+
+        // ① 响应链找 UIApplication，调它的 openURL:（iOS 15/17 上实测有效）
+        //    注意：扩展里禁止写 UIApplication.shared（编译期不可用 + 运行期断言），
+        //    但顺着 next 链摸到的那个实例是现成的，不经过被禁的入口。
+        let sel = NSSelectorFromString("openURL:")
+        if let app = findResponder(respondingTo: sel)
         {
-            ctx.open(url) { success in
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                    self?.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
-                }
+            _ = app.perform(sel, with: url)
+            route = "responder"
+        }
+
+        // ② 官方接口，分享扩展上通常被无视，但万一某版系统放开了呢（成本几乎为零）
+        if let ctx = extensionContext
+        {
+            ctx.open(url) { _ in }
+            if route == "none" { route = "context" }
+        }
+
+        return route
+    }
+
+    /// 顺响应链（VC → view → window → … → UIApplication）找第一个能响应 sel 的对象
+    private func findResponder(respondingTo sel: Selector) -> UIResponder?
+    {
+        var seeds: [UIResponder] = [self]
+        if let v = viewIfLoaded
+        {
+            seeds.append(v)
+            if let w = v.window { seeds.append(w) }
+        }
+        for seed in seeds
+        {
+            var cur: UIResponder? = seed
+            var hops = 0
+            while let c = cur, hops < 48
+            {
+                if c.responds(to: sel) { return c }
+                cur = c.next
+                hops += 1
             }
         }
-        else
-        {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
-            }
-        }
+        return nil
+    }
+
+    // MARK: - 通知兜底
+
+    /// 5 秒后的本地通知：主 APP 一旦到前台会立刻撤销它，所以成功跳转时用户看不到；
+    /// 只有跳转被系统吞掉时它才浮现，点一下照样进到「分享到 RayDrop」面板。
+    private func scheduleReadyNotification(_ count: Int)
+    {
+        let center = UNUserNotificationCenter.current()
+        let content = UNMutableNotificationContent()
+        content.title = "已选好 \(count) 项"
+        content.body = "点这里打开 RayDrop，选设备即可发送"
+        content.sound = .default
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 5, repeats: false)
+        let req = UNNotificationRequest(identifier: readyNotificationID, content: content, trigger: trigger)
+        center.add(req) { _ in }
+    }
+
+    /// 把本次跳转结果写到 App Group，主 APP 读走后会删掉并打进日志
+    private func writeDiag(route: String, count: Int)
+    {
+        guard let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else { return }
+        let f = base.appendingPathComponent("last_share_diag.txt")
+        let text = "v47 跳转=\(route) 项=\(count)"
+        try? text.write(to: f, atomically: true, encoding: .utf8)
     }
 }

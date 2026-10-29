@@ -1204,6 +1204,15 @@ final class Engine: ObservableObject {
         guard let dir = Engine.sharedDir else { return }
         let inbox = dir.appendingPathComponent("inbox")
 
+        // ★ v47：读走分享扩展留下的跳转诊断（它用哪条路把 App 拉起来的），读完即删。
+        //   这条信息是排障唯一线索 —— 万一某台手机上「自动跳转」失效，日志里能直接看出来。
+        var jumpNote = ""
+        let diagURL = dir.appendingPathComponent("last_share_diag.txt")
+        if let t = try? String(contentsOf: diagURL, encoding: .utf8) {
+            jumpNote = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            try? FileManager.default.removeItem(at: diagURL)
+        }
+
         // 1) 清理超过 1 小时的残留（上次崩溃/被杀进程留下的），避免历史文件再冒出来
         if let olds = try? FileManager.default.contentsOfDirectory(at: inbox, includingPropertiesForKeys: [.contentModificationDateKey]) {
             for old in olds {
@@ -1255,6 +1264,7 @@ final class Engine: ObservableObject {
             self.sharedItems = got
             self.showSharePrompt = true
             self.addLog("收到分享内容 \(got.count) 项，请选择设备发送")
+            if !jumpNote.isEmpty { self.addLog("（\(jumpNote)）") }
         }
     }
 
@@ -1616,6 +1626,14 @@ struct ShareInboxSheet: View {
     @ObservedObject var engine: Engine
     @Environment(\.dismiss) private var dismiss
 
+    /// ★ v47：只有一台设备在线时返回它（连同可用的主机地址）；0 台或多台返回 nil。
+    ///   多台时不给大按钮 —— 猜错对象就把私密照片发错人了。
+    private var onlyAliveDevice: (Engine.DeviceInfo, String)? {
+        let alive = engine.devices.filter { engine.lanAlive($0) || engine.tsAlive($0) }
+        guard alive.count == 1, let d = alive.first else { return nil }
+        return (d, engine.lanAlive(d) ? d.lanHost : d.tsHost)
+    }
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
@@ -1639,6 +1657,22 @@ struct ShareInboxSheet: View {
                     }
                 }
                 Divider()
+                // ★ v47：只发现一台设备时给一个大按钮，省得在列表里找
+                if let one = onlyAliveDevice {
+                    Button {
+                        engine.sendShared(to: one.0, host: one.1)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: one.0.isComputer ? "desktopcomputer" : "iphone")
+                            Text("发给 \(one.0.name)").fontWeight(.semibold)
+                            Spacer()
+                            Image(systemName: "arrow.up.circle.fill")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .padding(.horizontal).padding(.top, 10)
+                }
                 if engine.devices.isEmpty {
                     Text("未发现设备…").foregroundColor(.gray).padding(12)
                 } else {

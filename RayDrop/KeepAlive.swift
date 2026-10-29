@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import UIKit
+import UserNotifications
 
 /// 后台保活：iOS 只允许在声明的后台模式里继续执行代码。声明 `audio` 后，用一个
 /// 静音循环音频会话把进程挂在后台，从而让 UDP 发现 + TCP 接收服务持续运行。
@@ -113,6 +114,7 @@ final class RDAppDelegate: NSObject, UIApplicationDelegate
                      didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool
     {
         RDKeepAlive.shared.start()
+        RDShareNotify.requestAuthIfNeeded()
         listenForShare()
         return true
     }
@@ -127,6 +129,8 @@ final class RDAppDelegate: NSObject, UIApplicationDelegate
     func applicationWillEnterForeground(_ application: UIApplication)
     {
         RDIdleExit.shared.willEnterForeground()
+        // ★ v47：已经回到 App 了，分享扩展排的那条「点此发送」通知就没意义了 → 撤掉
+        RDShareNotify.cancelReady()
     }
 
     /// 分享扩展通过 Darwin 通知告知"inbox 里有新文件"；主 APP 在前台或后台都会收到
@@ -236,3 +240,35 @@ final class RDIdleExit
     }
 }
 
+
+/// 分享扩展 ↔ 主 APP 的通知协作（v47）
+///
+/// 为什么需要它：iOS 不让分享扩展切到宿主 APP。v47 用非官方接口强行跳转（见
+/// `ShareViewController.jumpToHostApp()`），但那条路不是 100% 有效，所以扩展同时排了
+/// 一条 5 秒后的本地通知当兜底 —— 跳转成功时主 APP 会在 5 秒内到前台，这里把它撤掉，
+/// 用户什么都看不到；跳转失败时通知才浮现，点一下照样进面板。
+///
+/// 通知授权只能在主 APP 里申请（扩展无权弹授权框），因此启动时问一次；用户拒绝的话
+/// 整套兜底自动失效，退化成「回相册」，不影响其它功能。
+enum RDShareNotify
+{
+    /// 与 `ShareViewController.readyNotificationID` 必须一致
+    static let readyID = "rd_share_ready"
+
+    static func requestAuthIfNeeded()
+    {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { s in
+            guard s.authorizationStatus == .notDetermined else { return }
+            center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+    }
+
+    /// 撤掉（未送达的 + 已送达的）分享就绪通知
+    static func cancelReady()
+    {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [readyID])
+        center.removeDeliveredNotifications(withIdentifiers: [readyID])
+    }
+}
