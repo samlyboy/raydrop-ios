@@ -1461,7 +1461,6 @@ final class Engine: ObservableObject {
 // MARK: - 主界面（发送类型 → 设备 → 状态）
 struct ContentView: View {
     @StateObject var engine = Engine()
-    @State var showPhoto = false
     @State var showPhoto = false       // 系统选择器（零权限、全量、永远不漏）
     @State var showPicker = false      // 自建网格（仅「所有照片」授权时用，带滑动连选）
     @State var showDoc = false
