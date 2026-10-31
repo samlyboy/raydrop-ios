@@ -4,6 +4,7 @@ import PhotosUI
 import Photos
 import UniformTypeIdentifiers
 import UIKit
+import AVFoundation
 
 final class Engine: ObservableObject {
     /// 分享扩展传来的待发送项
@@ -1046,13 +1047,21 @@ final class Engine: ObservableObject {
     ///   → 原始版本（.fullSizePhoto / .fullSizeVideo，编辑前）
     ///   → 兜底取第一个。
     /// `isNetworkAccessAllowed = true`：iCloud 里只有缩略图的资源会自动下载原文件。
+    ///
+    /// ★ v47.3：iCloud 共享相簿里的资产**没有可写的 PHAssetResource**，
+    ///   `assetResources(for:)` 直接返回空 → 以前会整项报「这个资源没有可取的文件」。
+    ///   现在遇到这种（以及 writeData 失败）就退到 `PHImageManager` 取：
+    ///   照片走 requestImageDataAndOrientation，视频走 requestAVAsset + 复制原文件。
+    ///   这样列表里能看到的，基本都能发出去。
     static func exportAsset(_ asset: PHAsset) async -> (URL?, String) {
         await withCheckedContinuation { (cont: CheckedContinuation<(URL?, String), Never>) in
             let once = Once<(URL?, String)>(cont)
 
             let all = PHAssetResource.assetResources(for: asset)
             guard !all.isEmpty else {
-                once.fire((nil, "这个资源没有可取的文件")); return
+                // 共享相簿 / 受限来源：交给 PHImageManager
+                Engine.exportViaImageManager(asset) { u, why in once.fire((u, why)) }
+                return
             }
             let res = all.first { $0.type == .photo || $0.type == .video }
                 ?? all.first { $0.type == .fullSizePhoto || $0.type == .fullSizeVideo }
@@ -1067,7 +1076,12 @@ final class Engine: ObservableObject {
 
             PHAssetResourceManager.default().writeData(for: res, toFile: dst, options: opt) { err in
                 if let err = err {
-                    once.fire((nil, err.localizedDescription)); return
+                    // 写失败也兜底一次（共享相簿、某些第三方写入的资产常见）
+                    Engine.exportViaImageManager(asset) { u, why in
+                        if let u = u { once.fire((u, "")) }
+                        else { once.fire((nil, why.isEmpty ? err.localizedDescription : why)) }
+                    }
+                    return
                 }
                 let sz = ((try? FileManager.default.attributesOfItem(atPath: dst.path))?[.size] as? NSNumber)?.int64Value ?? 0
                 guard sz > 0 else {
@@ -1081,6 +1095,66 @@ final class Engine: ObservableObject {
             // 兜底：iCloud 原文件下载卡住时不能无限等
             DispatchQueue.global().asyncAfter(deadline: .now() + 900) {
                 once.fire((nil, "导出超过 15 分钟未完成（可能是 iCloud 原文件未下载完）"))
+            }
+        }
+    }
+
+    /// 没有 `PHAssetResource` 时的取文件通道（iOS 15 起可用）。
+    /// 照片用 `requestImageDataAndOrientation` 拿原始数据；视频用 `requestAVAsset`，
+    /// 拿到 AVURLAsset 就直接复制文件（不转码），拿不到（需要合成的）如实报错。
+    static func exportViaImageManager(_ asset: PHAsset,
+                                      done: @escaping (URL?, String) -> Void) {
+        if asset.mediaType == .video {
+            let o = PHVideoRequestOptions()
+            o.isNetworkAccessAllowed = true
+            o.version = .current
+            o.deliveryMode = .highQualityFormat
+            PHImageManager.default().requestAVAsset(forVideo: asset, options: o) { av, _, info in
+                guard let urlAsset = av as? AVURLAsset else {
+                    let why = (info?[PHImageErrorKey] as? NSError)?.localizedDescription
+                    done(nil, why ?? "该视频需要转码才能取出，暂不支持")
+                    return
+                }
+                let src = urlAsset.url
+                let raw = src.lastPathComponent.isEmpty
+                    ? "video_\(UUID().uuidString.prefix(8)).mov" : src.lastPathComponent
+                let dst = Engine.makeTempSlot(for: raw)
+                do {
+                    try? FileManager.default.removeItem(at: dst)
+                    try FileManager.default.copyItem(at: src, to: dst)
+                    let sz = ((try? FileManager.default.attributesOfItem(atPath: dst.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                    guard sz > 0 else { done(nil, "导出的视频为空"); return }
+                    done(Engine.alignExtension(dst), "")
+                } catch {
+                    done(nil, "复制视频失败：\(error.localizedDescription)")
+                }
+            }
+            return
+        }
+
+        let o = PHImageRequestOptions()
+        o.isNetworkAccessAllowed = true
+        o.version = .current
+        o.deliveryMode = .highQualityFormat
+        o.resizeMode = .none
+        PHImageManager.default().requestImageDataAndOrientation(for: asset, options: o) { data, uti, _, info in
+            // 先给的降质图不能当原图写出去（否则发出去是糊的），等最终版
+            if let degraded = info?[PHImageResultIsDegradedKey] as? Bool, degraded { return }
+            guard let data = data, !data.isEmpty else {
+                let why = (info?[PHImageErrorKey] as? NSError)?.localizedDescription ?? "取不到照片数据"
+                done(nil, why)
+                return
+            }
+            var ext = "jpg"
+            if let uti = uti, let prefer = UTType(uti)?.preferredFilenameExtension, !prefer.isEmpty {
+                ext = prefer
+            }
+            let dst = Engine.makeTempSlot(for: "photo_\(UUID().uuidString.prefix(8)).\(ext)")
+            do {
+                try data.write(to: dst)
+                done(Engine.alignExtension(dst), "")
+            } catch {
+                done(nil, "写文件失败：\(error.localizedDescription)")
             }
         }
     }

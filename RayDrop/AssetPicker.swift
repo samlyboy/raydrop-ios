@@ -1,6 +1,7 @@
 import SwiftUI
 import Photos
 import UIKit
+import Combine
 
 // MARK: - 自建相册选择器（v45）
 //
@@ -27,8 +28,30 @@ import UIKit
 //   实现：选中区域按「行从下往上、行内从右往左」遍历取号。
 //   点选（tap）仍然是「点的先后 = 编号」，两种方式的结果可以混着用。
 //
-// 排序：PHFetchOptions 按 creationDate **升序**（最老在前、最新在最后），
+// 排序：内存按时间戳**升序**（最老在前、最新在最后），
 //       所以最新的那张在内容末尾 → 滚到底 = 右下角。
+//
+// MARK: - v47.3：与系统相册「全量同步」
+//
+// v47.2 之前有三个会让照片/视频「明明在相册里，RayDrop 却看不到」的缺口：
+//
+// 【1】PHFetchOptions.includeAssetSourceTypes 没设，走默认的 typeUserLibrary
+//      → **整组 iCloud 共享相簿的资产都不返回**（系统「照片」App 却会显示）。
+//      现在显式带上 .typeCloudShared。
+//
+// 【2】授权是「选中的照片」（.limited）时，fetch 只返回当初勾的那一批，
+//      之后新存进来的（比如从 LINE 保存的视频）永远不在里面，而且无任何提示。
+//      现在：先照常显示已授权的、不拦路；顶部出现一条提示条，
+//      点一下走 presentLimitedLibraryPicker 一次补齐（iOS 不允许 App 自己提权）。
+//
+// 【3】排序原用 NSSortDescriptor(key: "creationDate")，creationDate 为 nil 的资产
+//      在数据库排序里位置不可控（实测会落到最前），而"最新在右下"意味着用户
+//      打开就停在末尾 —— 这类资产永远刷不到。现在改内存排序：nil 退到
+//      modificationDate，两个都没有就当最新排末尾（宁可见得到，也不沉底），
+//      再加 localIdentifier 做 tie-breaker 保证顺序稳定。
+//
+// 【4】新增 PHPhotoLibraryChangeObserver：相册里新增/删除/修改，列表自动刷新，
+//      不需要退出重进（这就是"自动同步"）。
 
 struct AssetPickerView: View {
     let onCancel: () -> Void
@@ -38,6 +61,8 @@ struct AssetPickerView: View {
     let onDone: ([PHAsset]) -> Void
 
     @StateObject private var host = ScrollHost()
+    /// 相册变更监听：有增删改就自动重取，不必重开页面
+    @StateObject private var watcher = LibraryWatcher()
 
     @State private var auth: PHAuthorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     @State private var assets: [PHAsset] = []
@@ -69,13 +94,28 @@ struct AssetPickerView: View {
             VStack(spacing: 0) {
                 topBar
                 Rectangle().fill(Color.white.opacity(0.08)).frame(height: 0.5)
+                // 只在「部分授权」时出现：不拦路，但把补齐入口摆在最显眼处
+                if auth == .limited { limitedBar }
                 bodyContent
                 bottomBar
             }
         }
         .preferredColorScheme(.dark)
-        .onAppear(perform: start)
-        .onDisappear { host.lock(false) }
+        .onAppear {
+            watcher.onChange = { loadAssets(silent: true) }
+            watcher.start()
+            start()
+        }
+        .onDisappear {
+            host.lock(false)
+            watcher.stop()
+        }
+        // 从「设置」或系统授权面板回来 → 重新读授权状态并重取，补齐后立刻生效
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            let s = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            if s != auth { auth = s }
+            if s == .authorized || s == .limited { loadAssets(silent: true) }
+        }
     }
 
     // MARK: 顶部
@@ -98,6 +138,37 @@ struct AssetPickerView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 12)
+    }
+
+    /// 只在 .limited（「选中的照片」授权）时出现。
+    /// 不挡操作，但点一次就能补齐到「所有照片」——补齐后 fetch 才是全量。
+    private var limitedBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundColor(Color(red: 1, green: 0.78, blue: 0.25))
+            Text("只显示已授权的 \(assets.count) 项")
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.7))
+            Spacer(minLength: 4)
+            Button(action: askFullAccess) {
+                Text("允许访问全部")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 9).padding(.vertical, 4)
+                    .background(blue).cornerRadius(6)
+            }
+            Button(action: onFallback) {
+                Text("系统相册")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.85))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Color.white.opacity(0.12)).cornerRadius(6)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Color(red: 0.14, green: 0.11, blue: 0.06))
     }
 
     private var bottomBar: some View {
@@ -125,9 +196,21 @@ struct AssetPickerView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if assets.isEmpty {
-            Text("相册里没有可发送的照片或视频")
-                .font(.footnote).foregroundColor(.white.opacity(0.5))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 12) {
+                Text("相册里没有可发送的照片或视频")
+                    .font(.footnote).foregroundColor(.white.opacity(0.5))
+                if auth == .limited {
+                    // 部分授权时「空」基本等于「没勾到」，给一条直达系统的出口
+                    Button(action: onFallback) {
+                        Text("用系统相册选择")
+                            .font(.system(size: 14, weight: .medium))
+                            .padding(.horizontal, 16).padding(.vertical, 8)
+                            .background(Color.white.opacity(0.14))
+                            .foregroundColor(.white).cornerRadius(9)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             grid
         }
@@ -307,6 +390,7 @@ struct AssetPickerView: View {
         auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         switch auth {
         case .authorized, .limited:
+            // .limited 也照常显示已授权的那部分：先让用户看到东西，再谈补齐
             loadAssets()
         case .notDetermined:
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in
@@ -320,13 +404,37 @@ struct AssetPickerView: View {
         }
     }
 
-    private func loadAssets() {
-        loading = true
+    /// 「只显示部分」时，调系统面板一次补齐到所有照片。
+    /// iOS 不允许 App 自己提权，这是唯一的官方入口；补完靠 change observer / 回前台刷新。
+    private func askFullAccess() {
+        guard let vc = Self.topViewController() else { return }
+        PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: vc)
+    }
+
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let win = scenes.flatMap { $0.windows }.first { $0.isKeyWindow }
+            ?? scenes.first?.windows.first
+        var vc = win?.rootViewController
+        while let p = vc?.presentedViewController { vc = p }
+        return vc
+    }
+
+    /// 排序用时间戳：creationDate 缺失时退到修改时间，再缺就当作「最新」排到末尾。
+    /// 宁可占末尾（打开就能看到）也不要沉到最老端 —— 那等于让用户翻几千张都碰不着它。
+    /// （原实现交给数据库排 creationDate，nil 的落点不可控，正是「怎么翻都找不到」的成因之一）
+    private static func stamp(_ a: PHAsset) -> Date {
+        a.creationDate ?? a.modificationDate ?? Date.distantFuture
+    }
+
+    private func loadAssets(silent: Bool = false) {
+        if !silent { loading = true }
         // 取相册在后台线程，几千张也不会卡住首帧
         DispatchQueue.global(qos: .userInitiated).async {
             let opt = PHFetchOptions()
-            // ★ 升序：最老在最前、最新在最后 → 滚到底部即「最新在右下」
-            opt.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+            // ★ 全量来源：主库 + iCloud 共享相簿。
+            //   默认只有 typeUserLibrary，共享相簿整组不返回 —— 「相册里看得见、这里看不见」的主因之一。
+            opt.includeAssetSourceTypes = [.typeUserLibrary, .typeCloudShared]
             opt.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
                                         PHAssetMediaType.image.rawValue,
                                         PHAssetMediaType.video.rawValue)
@@ -334,6 +442,14 @@ struct AssetPickerView: View {
             var list: [PHAsset] = []
             list.reserveCapacity(r.count)
             r.enumerateObjects { a, _, _ in list.append(a) }
+            // ★ 升序：最老在最前、最新在最后 → 滚到底部即「最新在右下」
+            //   这里用内存排序而不是 sortDescriptors：时间戳兜底和 nil 的落点都自己控制。
+            //   localIdentifier 当 tie-breaker，保证刷新前后顺序稳定，格子不会来回跳。
+            list.sort { a, b in
+                let da = AssetPickerView.stamp(a), db = AssetPickerView.stamp(b)
+                if da == db { return a.localIdentifier < b.localIdentifier }
+                return da < db
+            }
             var index: [String: Int] = [:]
             index.reserveCapacity(list.count)
             for (i, a) in list.enumerated() { index[a.localIdentifier] = i }
@@ -531,6 +647,36 @@ private struct AssetCell: View {
         ThumbCache.shared.load(asset) { u in
             if let u = u { img = u }
         }
+    }
+}
+
+// MARK: - 相册变更监听（自动同步）
+
+/// 相册里新增 / 删除 / 编辑 → 立刻回调，列表自动刷新，不用退出重进。
+/// 这是「打开就是最新」的前提：否则存完视频再进来，列表还是打开那一刻的快照。
+final class LibraryWatcher: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
+    var onChange: (() -> Void)?
+    private var registered = false
+    private var lastFire = Date.distantPast
+
+    func start() {
+        guard !registered else { return }
+        PHPhotoLibrary.shared().register(self)
+        registered = true
+    }
+
+    func stop() {
+        guard registered else { return }
+        PHPhotoLibrary.shared().unregisterChangeObserver(self)
+        registered = false
+    }
+
+    func photoLibraryDidChange(_ changeInstance: PHChange) {
+        // 节流：iCloud 同步时会连续抛很多次，没必要每次都重建整个网格
+        let now = Date()
+        guard now.timeIntervalSince(lastFire) > 0.5 else { return }
+        lastFire = now
+        DispatchQueue.main.async { [weak self] in self?.onChange?() }
     }
 }
 
