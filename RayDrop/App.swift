@@ -98,7 +98,9 @@ final class Engine: ObservableObject {
     private var beganAt = Date()
     private var loggedFirstDiscovery = false
 
-    static let cIn = Color(red: 0.90, green: 0.22, blue: 0.21)
+    /// 接收成功 → 绿色（用户 2026-11-01 要求：接收成功的字体改为绿色）
+    /// 注意这是**日志行**的颜色；发送成功仍然用同一族绿色（方向靠「→ 本机 / 本机 →」区分）
+    static let cIn = Color(red: 0.25, green: 0.82, blue: 0.45)
     static let cOut = Color(red: 0.18, green: 0.60, blue: 0.24)
     static let cSys = Color.secondary
     private static let fmtTime: DateFormatter = { let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"; return f }()
@@ -1464,7 +1466,7 @@ struct ContentView: View {
     private var transferBar: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
-                Text(engine.status).font(.caption).lineLimit(1)
+                Text(engine.status).font(.caption).lineLimit(1).foregroundColor(statusColor)
                 Spacer()
                 if !engine.progress.isEmpty { Text(engine.progress).font(.caption).foregroundColor(.secondary) }
             }
@@ -1477,6 +1479,18 @@ struct ContentView: View {
             }
         }
         .padding(.horizontal).padding(.vertical, 5)
+    }
+
+    /// 状态文字配色：**接收/发送「完成」= 绿色**；「失败 / 未完成 / 未进相册」= 橙色提醒；其余默认色。
+    /// 先判异常再判成功 —— 「接收完成：XX。3 项已存「下载」但未进相册」这种既成功又带缺陷的，
+    /// 必须显示成需要处理的样子，不能被绿色盖过去。
+    private var statusColor: Color {
+        let s = engine.status
+        if s.contains("失败") || s.contains("未完成") || s.contains("未进相册") {
+            return Color(red: 0.98, green: 0.62, blue: 0.12)
+        }
+        if s.hasPrefix("接收完成") || s.hasPrefix("发送完成") { return Engine.cIn }
+        return .primary
     }
 
     private var logView: some View {
