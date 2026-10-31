@@ -9,8 +9,8 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>RayDrop</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>47.6</string>
-	<key>CFBundleVersion</key><string>56</string>
+	<key>CFBundleShortVersionString</key><string>47.7</string>
+	<key>CFBundleVersion</key><string>57</string>
 	<key>LSRequiresIPhoneOS</key><true/>
 	<!-- ★ 接收文件全自动落盘到沙盒 Documents/下载，并让该目录在系统「文件」App 里直接可见（我的 iPhone → RayDrop锐传 → 下载），无需手动"存储到文件" -->
 	<key>UIFileSharingEnabled</key><true/>
