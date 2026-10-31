@@ -103,6 +103,18 @@ final class Engine: ObservableObject {
     static let cIn = Color(red: 0.25, green: 0.82, blue: 0.45)
     static let cOut = Color(red: 0.18, green: 0.60, blue: 0.24)
     static let cSys = Color.secondary
+
+    /// ★ v47.8：当前安装的版本号，显示在日志区顶部（用户 2026-11-01 要求「让我知道安装的是哪个版本」）。
+    ///
+    ///   必须**运行时从 Info.plist 读**，不能在代码里写死字符串 —— 否则每次发版都要记得改两处，
+    ///   漏改一次就会出现「包名是 47.8、界面显示 47.7」的假信息，比不显示更糟。
+    ///   读的是主 App 的 Info.plist；分享扩展是另一个 bundle，不参与这里。
+    static let versionText: String = {
+        let info = Bundle.main.infoDictionary
+        let v = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = info?["CFBundleVersion"] as? String ?? "?"
+        return "RayDrop v\(v)（build \(b)）"
+    }()
     private static let fmtTime: DateFormatter = { let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"; return f }()
 
     /// 新条目插在「当前批次时间戳分隔行」之下；没有分隔行则插最顶。
@@ -1494,20 +1506,34 @@ struct ContentView: View {
     }
 
     private var logView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 3) {
-                ForEach(engine.logEntries) { e in
-                    if e.isHeader {
-                        Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1)
-                        Text(e.text).font(.caption2).foregroundColor(.secondary)
-                        Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1)
-                    } else {
-                        Text(e.text + (e.repeats > 1 ? "（×\(e.repeats)）" : "")).font(.caption2).foregroundColor(e.inColor)
+        VStack(alignment: .leading, spacing: 0) {
+            // ★ v47.8：版本号固定在日志区顶部，**不参与滚动、不进 logEntries**。
+            //   日志的规则是「最新一条插在最顶」，所以版本号一旦混进列表，聊天式的
+            //   新条目会立刻把它顶下去，用户真想看版本时反而找不到 —— 必须独立成一行。
+            HStack(spacing: 6) {
+                Text(Engine.versionText)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.top, 6)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(engine.logEntries) { e in
+                        if e.isHeader {
+                            Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1)
+                            Text(e.text).font(.caption2).foregroundColor(.secondary)
+                            Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1)
+                        } else {
+                            Text(e.text + (e.repeats > 1 ? "（×\(e.repeats)）" : "")).font(.caption2).foregroundColor(e.inColor)
+                        }
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal).padding(.vertical, 4)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal).padding(.vertical, 4)
         }
     }
 }
