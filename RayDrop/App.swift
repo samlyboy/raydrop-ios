@@ -86,6 +86,9 @@ final class Engine: ObservableObject {
     private var didStart = false
     /// 跨 Tailscale 发现：从 Tailscale API 拉到的 tailnet 设备 100.x（非本机），作为单播探测目标
     private var tsTargets: [String] = []
+    /// ★ v47.9：OAuth 拉到的「最近在线」对端（lastSeen 在 5 分钟内），用于诊断「发现但收不到回应」。
+    ///   只保留近期有心跳的设备：离线设备本就不会回 UDP 探测，拿它们当判据会误报。
+    private var tsOnlinePeers: [Tailscale.TSDevice] = []
     /// ★ v47.2：上次见过 / 连过的对端地址（持久化，最多 8 个）。
     ///
     ///   冷启动时 `devices` 是空的，这时**只能等对端每 2s 一轮的广播**；而 iOS 的 UDP 广播在
@@ -394,6 +397,20 @@ final class Engine: ObservableObject {
     func tsAlive(_ d: DeviceInfo) -> Bool {
         !d.tsHost.isEmpty && Date().timeIntervalSince(d.tsSeen) <= Engine.tsTtl
     }
+    /// ★ v47.9：入站拦截诊断提示。
+    ///   条件：已通过 Tailscale API 发现「最近在线」的对端（说明 Tailscale 已连、且对端确实在），
+    ///   但启动 15 秒后本机仍一条 TS 回应都没收到 —— 这基本只可能是 iPhone 关了
+    ///   Tailscale 的「允许传入连接」，把从 100.x 进来的包在隧道层全丢了。
+    ///   返回 nil = 不需要提示；返回文案 = 在设备列表顶部横幅显示。
+    ///   一旦真收到回应（tsAlive 成立），此值自动变回 nil，横幅消失。
+    var tsInboundBlockedHint: String? {
+        guard !tsOnlinePeers.isEmpty else { return nil }
+        guard Date().timeIntervalSince(beganAt) > 15 else { return nil }   // 给首轮公告/回应留出时间
+        guard !devices.contains(where: { tsAlive($0) }) else { return nil }
+        let names = tsOnlinePeers.map { $0.name }.joined(separator: "、")
+        return "已发现 \(tsOnlinePeers.count) 台 Tailscale 设备（\(names)），但收不到它们的回应。\n" +
+               "多半是 iPhone 的 Tailscale 关了「允许传入连接」：打开 Tailscale App → 设置 → 允许传入连接，打开即可。"
+    }
     private func syncTargets() {
         var all: [String] = []
         for d in devices { if !d.lanHost.isEmpty { all.append(d.lanHost) }; if !d.tsHost.isEmpty { all.append(d.tsHost) } }
@@ -420,6 +437,9 @@ final class Engine: ObservableObject {
             let devs = Tailscale.shared.peerTSDevices()
             guard !devs.isEmpty else { return }   // API 失败/空：保活现有 targets，下次周期重试
             DispatchQueue.main.async {
+                // ★ v47.9：先筛出「最近在线」的对端，供入站拦截诊断用（离线设备不回探测，剔除避免误报）
+                let cutoff = Date().addingTimeInterval(-Tailscale.onlineWindow)
+                self.tsOnlinePeers = devs.filter { ($0.lastSeen ?? .distantPast) > cutoff }
                 let addrs = devs.map { $0.ip }
                 let old = Set(self.tsTargets)
                 self.tsTargets = addrs
@@ -1429,6 +1449,20 @@ struct ContentView: View {
     private var deviceList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 2) {
+                // ★ v47.9：入站拦截诊断横幅。用 TimelineView 每秒重算（不依赖 Engine 的 @Published），
+                //   一旦「发现在线对端却收不到回应」成立就立刻浮现，收到回应即自动消失。
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    if let hint = engine.tsInboundBlockedHint {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange).font(.caption).padding(.top, 1)
+                            Text(hint).font(.caption2).fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.horizontal).padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.orange.opacity(0.12))
+                    }
+                }
                 // ★ 列表只显示「真从对应通道收到过报文」的设备（各自窗口内）；两条都断就整台消失。
                 //   已移除「Tailscale · 离线」灰显组：离线设备不再进列表。
                 let lan = engine.devices.filter { engine.lanAlive($0) }

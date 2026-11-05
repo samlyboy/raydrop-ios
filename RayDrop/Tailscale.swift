@@ -39,9 +39,16 @@ final class Tailscale {
         peerTSDevices().map { $0.ip }
     }
 
-    /// ★ 两层模型 · 第一层「花名册」：tailnet 内全部已知设备（名字 + 100.x），
+    /// ★ 两层模型 · 第一层「花名册」：tailnet 内全部已知设备（名字 + 100.x + 最近心跳），
     /// 无论对方 RayDrop 是否在线都返回，供 UI 常显（离线设备灰显）。
-    struct TSDevice { let name: String; let ip: String }
+    struct TSDevice {
+        let name: String
+        let ip: String
+        /// 最近一次心跳（API 返回的 lastSeen，ISO8601）。nil = 没拿到 / 解析失败。
+        let lastSeen: Date?
+    }
+    /// 设备「算作在线」的判定窗口：超过这么久没心跳就当离线（不会回我们的 UDP 探测）。
+    static let onlineWindow: TimeInterval = 300
     func peerTSDevices() -> [TSDevice] {
         do {
             let tok = try token()
@@ -60,9 +67,11 @@ final class Tailscale {
             var out: [TSDevice] = []
             for d in devs {
                 let name = (d["name"] as? String) ?? "设备"
+                // lastSeen 形如 "2026-11-01T12:00:00Z"，用 ISO8601 解析（容忍含毫秒）
+                let ls = (d["lastSeen"] as? String).flatMap { Self.parseISO8601($0) }
                 guard let addrs = d["addresses"] as? [String] else { continue }
                 for ip in addrs where ip.hasPrefix("100.") {
-                    if !selfIPs.contains(ip) { out.append(TSDevice(name: name, ip: ip)) }
+                    if !selfIPs.contains(ip) { out.append(TSDevice(name: name, ip: ip, lastSeen: ls)) }
                 }
             }
             return out
@@ -70,6 +79,14 @@ final class Tailscale {
             print("[RayDrop] ts refresh failed: \(error.localizedDescription)")
             return []
         }
+    }
+    /// 解析 API 的 ISO8601 时间串（兼容 "…Z" 与含毫秒的 "….123Z"）。
+    private static func parseISO8601(_ s: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: s)
     }
 }
 
