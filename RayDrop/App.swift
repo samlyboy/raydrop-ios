@@ -89,6 +89,13 @@ final class Engine: ObservableObject {
     /// ★ v47.9：OAuth 拉到的「最近在线」对端（lastSeen 在 5 分钟内），用于诊断「发现但收不到回应」。
     ///   只保留近期有心跳的设备：离线设备本就不会回 UDP 探测，拿它们当判据会误报。
     private var tsOnlinePeers: [Tailscale.TSDevice] = []
+    /// ★ v47.12：本机当前的 Tailscale 地址（100.x）。空 = 本机没连 Tailscale（用户没开 / 主动断开）。
+    ///
+    ///   这是「TS 通道是否可能存在」的**硬前提**：本机没有 100.x 接口时，对端的 100.x 报文
+    ///   根本进不来，列表里也就不该出现【Tailscale】组 —— 否则会挂着一台点不动、传不过去的
+    ///   幽灵设备，用户以为软件坏了（2026-11-06 实测反馈）。
+    ///   由 `cull()` 每 5 秒刷新一次，变化时立即清掉全部 TS 通道痕迹，不等 tsTtl 过期。
+    @Published private(set) var localTSIP: String = ""
     /// ★ v47.2：上次见过 / 连过的对端地址（持久化，最多 8 个）。
     ///
     ///   冷启动时 `devices` 是空的，这时**只能等对端每 2s 一轮的广播**；而 iOS 的 UDP 广播在
@@ -290,6 +297,7 @@ final class Engine: ObservableObject {
         receiver.start(); discovery.start()
         // ★ v47.2：把「上次见过的对端」立刻塞进单播目标。
         //   冷启动时 devices 为空，若只靠广播，遇到路由器丢广播 / Wi-Fi 省电要等 10s 才出现设备。
+        refreshLocalTS()   // ★ v47.12：先确认本机有没有 Tailscale 地址，决定 TS 通道是否参与
         syncTargets()
         // ★ 1s 一轮巡检：通道断开（LAN 10s / TS 20s）与整机离线都能在 1s 内反映到界面；
         //   同时每 5s 做一次「接收监听健康检查」——NWListener 被系统压成 waiting/failed 后不会自愈，
@@ -404,9 +412,11 @@ final class Engine: ObservableObject {
     func lanAlive(_ d: DeviceInfo) -> Bool {
         !d.lanHost.isEmpty && Date().timeIntervalSince(d.lanSeen) <= Engine.lanTtl
     }
-    /// Tailscale 通道是否在线（tsTtl 内真从 100.x 收到过报文）
+    /// Tailscale 通道是否在线：本机必须真的连着 TS，**且** tsTtl 内真从 100.x 收到过报文。
+    /// ★ v47.12：加了 `!localTSIP.isEmpty` 前置条件 —— 本机没连 TS 时通道不可能通，
+    ///   哪怕还有未过期的 tsHost（关 TS 后 45s 内），也不显示。
     func tsAlive(_ d: DeviceInfo) -> Bool {
-        !d.tsHost.isEmpty && Date().timeIntervalSince(d.tsSeen) <= Engine.tsTtl
+        !localTSIP.isEmpty && !d.tsHost.isEmpty && Date().timeIntervalSince(d.tsSeen) <= Engine.tsTtl
     }
     private func syncTargets() {
         var all: [String] = []
@@ -414,7 +424,35 @@ final class Engine: ObservableObject {
         all.append(contentsOf: tsTargets)   // 跨 Tailscale 拉到的 tailnet 设备 100.x 也作为单播探测目标
         all.append(contentsOf: savedPeers)  // ★ v47.2：上次见过的对端，冷启动时唯一的敲门目标
         all.append(contentsOf: manualPeers) // ★ v47.10：用户手动加的目标，永远在探测列表里
+        // ★ v47.12：本机没连 TS 时，100.x 目标一个都发不出去（没有那个虚拟接口），
+        //   每 2s 白发一轮纯属浪费电 —— 包括 savedPeers 里存的上一轮 TS 地址。
+        if localTSIP.isEmpty { all.removeAll { $0.hasPrefix("100.") } }
         discovery.setExtraTargets(all)
+    }
+
+    /// ★ v47.12：读取本机 Tailscale 地址（100.x）。由 cull() 每 5s 调一次。
+    ///   状态发生变化时立刻收敛：停用 → 清掉所有 TS 通道痕迹并隐藏【Tailscale】组；
+    ///   启用 → 立即拉一次 tailnet 花名册开始探测（不等 15s 周期）。
+    private func refreshLocalTS() {
+        let ip = RDIP.ips().first { $0.hasPrefix("100.") } ?? ""
+        guard ip != localTSIP else { return }
+        let wasOn = !localTSIP.isEmpty
+        localTSIP = ip
+        if ip.isEmpty {
+            var dropped = 0
+            for i in devices.indices where !devices[i].tsHost.isEmpty {
+                devices[i].tsHost = ""; devices[i].tsSeen = .distantPast; dropped += 1
+            }
+            tsTargets = []
+            tsOnlinePeers = []
+            let kept = devices.filter { !$0.lanHost.isEmpty || !$0.tsHost.isEmpty }
+            if kept.count != devices.count { devices = kept }
+            syncTargets()
+            if wasOn { addLog("本机 Tailscale 已断开：隐藏 Tailscale 通道（\(dropped) 台），只走局域网") }
+        } else {
+            addLog("本机 Tailscale 已连接：\(ip)")
+            refreshTailscale()
+        }
     }
 
     /// 手动目标是否还没被任何通道证实过（用于列表里显示 ⏳ 等待发现）
@@ -486,6 +524,13 @@ final class Engine: ObservableObject {
     /// 用内嵌 OAuth client 拉取 tailnet 设备的 100.x，仅刷新「单播探测目标」。
     /// （已移除「花名册」显示层：tailnet 里没开 RayDrop 的设备不进列表，列表只显示真收到报文的在线设备。）
     private func refreshTailscale() {
+        // ★ v47.12：本机没连 TS 就别拉花名册了 —— 拿到了也连不上，
+        //   只会让 UI「先知道一堆设备、再发现全都点不动」。等 refreshLocalTS 检测到
+        //   本机出现 100.x 地址时会立刻重新调用本方法。
+        guard !localTSIP.isEmpty else {
+            if !tsTargets.isEmpty { tsTargets = []; syncTargets() }
+            return
+        }
         DispatchQueue.global().async {
             let devs = Tailscale.shared.peerTSDevices()
             guard !devs.isEmpty else { return }   // API 失败/空：保活现有 targets，下次周期重试
@@ -599,6 +644,10 @@ final class Engine: ObservableObject {
     private func cull() {
         let now = Date()
         var changed = false
+        // ★ v47.12：每 5s 复核「本机到底有没有 Tailscale 地址」。用户随时可能关掉 TS，
+        //   关掉那一刻起 TS 通道就不可能通 —— 必须立即把【Tailscale】组撤掉，
+        //   而不是等 45s 的 tsTtl 自然过期（那段时间里设备看着在线、点发送却传不过去）。
+        if healthTick % 5 == 0 { refreshLocalTS() }
         for i in devices.indices {
             if !devices[i].lanHost.isEmpty && now.timeIntervalSince(devices[i].lanSeen) > Engine.lanTtl {
                 devices[i].lanHost = ""; devices[i].lanSeen = .distantPast; changed = true
