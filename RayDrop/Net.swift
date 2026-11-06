@@ -91,14 +91,61 @@ extension RD {
     }
 }
 
+/// IPv4 位运算工具（v47.10 新增）
+/// 以前「同网段」只能靠「把 IP 按 . 切开只比前 3 段」实现 —— 那等于默认所有网络都是 /24。
+/// 在 /20 这类大网段里（本机 172.28.2.146/20、对端 172.28.13.159）前 3 段不同，
+/// 真实到达的包会被判成「非局域网」直接丢掉：电脑能看到手机、手机看不到电脑。
+/// 现在一律按真实掩码按位与，广播地址也按掩码算。
+enum NetMath {
+    static func toUInt32(_ ip: String) -> UInt32? {
+        let p = ip.split(separator: ".")
+        guard p.count == 4 else { return nil }
+        var v: UInt32 = 0
+        for s in p {
+            guard let b = UInt8(s) else { return nil }
+            v = (v << 8) | UInt32(b)
+        }
+        return v
+    }
+
+    static func mask(_ prefix: Int) -> UInt32 {
+        if prefix <= 0 { return 0 }
+        if prefix >= 32 { return ~UInt32(0) }
+        return ~UInt32(0) << UInt32(32 - prefix)
+    }
+
+    /// 两个地址是否同子网
+    static func sameSubnet(_ a: String, _ b: String, _ prefix: Int) -> Bool {
+        guard let x = toUInt32(a), let y = toUInt32(b), prefix > 0, prefix < 32 else { return false }
+        let m = mask(prefix)
+        return (x & m) == (y & m)
+    }
+
+    /// 定向广播地址 = network | ~mask（/20 得 172.28.15.255，而不是 /24 的 172.28.2.255）
+    static func broadcastOf(_ ip: String, _ prefix: Int) -> String? {
+        guard let v = toUInt32(ip), prefix > 0, prefix < 32 else { return nil }
+        let m = mask(prefix)
+        let b = (v & m) | ~m
+        return "\((b >> 24) & 255).\((b >> 16) & 255).\((b >> 8) & 255).\(b & 255)"
+    }
+}
+
 /// 枚举本机 IP。**根治"幽灵 IP"**：只上报当前 Wi-Fi 主接口(en0)的局域网地址 + Tailscale(100.x)。
 /// iOS 有多个虚拟接口（蜂窝 pdp_ip0、VPN ipsec/utun、点对点 awdl/llw、热点 bridge、隧道 gif/stf），
 /// 它们的 IPv4（如蜂窝/VPN 的 10.x）不是当前局域网可达地址——一旦上报给对端，会让对端的
 /// 「局域网 IP」在真实地址与幽灵地址间反复跳变，点到幽灵地址就连不通。
 enum RDIP {
-    static func ips() -> [String] {
-        // 先收集所有非 lo0 的 IPv4：(接口名, IP)
-        var all: [(String, String)] = []
+    /// 一个 IPv4 地址 + 所在接口 + 该接口的前缀长度（/20 → 20）
+    struct LanAddr {
+        let iface: String
+        let ip: String
+        let prefix: Int
+    }
+
+    /// 枚举所有非 lo0 的 IPv4（带接口名与前缀长度）
+    /// ★ v47.10：以前只读 ifa_addr、完全没有掩码概念，这是「手机看不到电脑」的根因
+    static func enumerate() -> [LanAddr] {
+        var out: [LanAddr] = []
         var addr: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&addr) == 0 {
             var p = addr
@@ -109,7 +156,9 @@ enum RDIP {
                     if name != "lo0" {
                         var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                         if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
-                            all.append((name, String(cString: host)))
+                            out.append(LanAddr(iface: name,
+                                               ip: String(cString: host),
+                                               prefix: prefixLen(ifa.ifa_netmask)))
                         }
                     }
                 }
@@ -117,21 +166,41 @@ enum RDIP {
             }
             freeifaddrs(addr)
         }
+        return out
+    }
+
+    /// 从 sockaddr 形式的 netmask 数出前缀长度（255.255.240.0 → 20）。读不到按 24 兜底（宁可保守）
+    static func prefixLen(_ sa: UnsafeMutablePointer<sockaddr>?) -> Int {
+        guard let sa = sa, sa.pointee.sa_family == UInt8(AF_INET) else { return 24 }
+        let sin = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        var m = UInt32(bigEndian: sin.sin_addr.s_addr)
+        var bits = 0
+        while bits < 32, (m & 0x8000_0000) != 0 { bits += 1; m <<= 1 }
+        return bits == 0 ? 24 : bits
+    }
+
+    /// 局域网地址 + 各自前缀（优先 Wi-Fi 主接口 en0，无 en0 时退回非虚拟接口）
+    static func lans() -> [LanAddr] {
+        let all = enumerate()
         let isLinkLocal = { (ip: String) in ip.hasPrefix("169.254.") }
-        // Tailscale：任何接口的 100.x 都保留（单列一组）
-        var ts = all.filter { $0.1.hasPrefix("100.") }.map { $0.1 }
-        // 局域网：优先 Wi-Fi 主接口 en0 的 IPv4（最权威、一定与对端同网段）
-        var lan = all.filter { $0.0 == "en0" && !isLinkLocal($0.1) }.map { $0.1 }
-        // 没有 en0（未连 Wi-Fi）时，退回"排除已知虚拟接口后的其它 IPv4"（如纯蜂窝/热点场景）
+        var lan = all.filter { $0.iface == "en0" && !isLinkLocal($0.ip) }
         if lan.isEmpty {
             let virtual: Set<String> = ["pdp_ip0","pdp_ip1","pdp_ip2","ipsec0","ipsec1",
                                         "utun0","utun1","utun2","utun3","utun4","utun5",
                                         "awdl0","llw0","gif0","stf0","bridge0","bridge1"]
-            lan = all.filter { !virtual.contains($0.0) && !isLinkLocal($0.1) && !$0.1.hasPrefix("100.") }.map { $0.1 }
+            lan = all.filter { !virtual.contains($0.iface) && !isLinkLocal($0.ip) && !$0.ip.hasPrefix("100.") }
         }
+        var seen = Set<String>(); var out: [LanAddr] = []
+        for a in lan where seen.insert(a.ip).inserted { out.append(a) }
+        return out
+    }
+
+    static func ips() -> [String] {
         var seen = Set<String>(); var out: [String] = []
-        for ip in ts  where seen.insert(ip).inserted { out.append(ip) }
-        for ip in lan where seen.insert(ip).inserted { out.append(ip) }
+        for a in enumerate() where a.ip.hasPrefix("100.") {
+            if seen.insert(a.ip).inserted { out.append(a.ip) }
+        }
+        for a in lans() where seen.insert(a.ip).inserted { out.append(a.ip) }
         return out
     }
     static func tailscaleIP() -> String { ips().first(where: { $0.hasPrefix("100.") }) ?? ips().first ?? "" }
@@ -253,13 +322,14 @@ final class RDDiscovery {
         for ip in targets() { send(to: ip) }
     }
 
-    /// 广播：受限广播 + 每个局域网网段的定向广播（x.x.x.255）。
+    /// 广播：受限广播 + 每个局域网网段的**定向广播**。
     /// iOS 上 255.255.255.255 经常被路由器或系统丢掉，定向广播能补上这一路。
+    /// ★ v47.10：地址按真实掩码算（network | ~mask）—— 以前硬拼 x.x.x.255 是 /24 假设，
+    ///   在 /20 里 172.28.2.255 根本不是广播地址，等于往一个不存在的单播地址发包，白丢。
     private func broadcast() {
         send(to: "255.255.255.255")
-        for ip in RDIP.ips() where !ip.hasPrefix("100.") {
-            let p = ip.split(separator: ".")
-            if p.count == 4 { send(to: "\(p[0]).\(p[1]).\(p[2]).255") }
+        for a in RDIP.lans() {
+            if let b = NetMath.broadcastOf(a.ip, a.prefix) { send(to: b) }
         }
     }
 

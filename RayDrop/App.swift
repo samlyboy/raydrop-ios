@@ -97,6 +97,12 @@ final class Engine: ObservableObject {
     ///   对端一收到就回告，设备列表亚秒级就能出来，不用等广播。
     private var savedPeers: [String] = UserDefaults.standard.stringArray(forKey: Engine.peersKey) ?? []
     static let peersKey = "rd.savedPeers"
+    /// ★ v47.10：用户**手动添加**的目标 IP（持久化）。与自动学习的 savedPeers 分开存：
+    ///   手动是「我确定它在」的明确意图 —— 不能被 8 条上限挤掉，也不该被自动学习覆盖。
+    ///   场景：广播被路由器/AP 抑制、或跨网段但三层可路由时，知道 IP 就能直连（跳过网段判定）。
+    @Published private(set) var manualPeers: [String] =
+        UserDefaults.standard.stringArray(forKey: Engine.manualKey) ?? []
+    static let manualKey = "rd.manualPeers"
     /// App 启动时刻，仅用于日志里报「启动后多少秒发现第一台设备」，便于日后判断发现链路是否变慢
     private var beganAt = Date()
     private var loggedFirstDiscovery = false
@@ -311,13 +317,16 @@ final class Engine: ObservableObject {
         //   此时**保留上一次已知端口**（大概率仍然有效），而不是把它清成 0 让设备变成点不动。
         let port = UInt16((o["port"] as? NSNumber)?.intValue ?? 0)
 
-        let myIPs = RDIP.ips()
         let src = o["srcIP"] as? String ?? ""
 
-        // ★ 关键判据（锐哥修正）：LAN 地址只有「包从真实局域网到达」(src 非 100.x 且与本机同 /24) 才可信。
-        //   从 Tailscale 包里对端自报的局域网地址(其自己另一物理网络的 192.168.1.x)即使恰巧同 /24，
+        // ★ 关键判据（锐哥修正，v47.10 再修）：LAN 地址只有「包从真实局域网到达」才可信。
+        //   从 Tailscale 包里对端自报的局域网地址(其自己另一物理网络的 192.168.1.x)即使恰巧同网段，
         //   也只是"假同局域网"——物理不互通、连不通，必须丢弃。
-        let viaLan = !src.isEmpty && !src.hasPrefix("100.") && Engine.sameSubnet(src, myIPs)
+        //   v47.10 起同网段按**真实掩码**按位与判定（原来只比前 3 段，等于假定所有网络都是 /24，
+        //   在 /20 下会把自己局域网里真实到达的包判成「非局域网」丢掉 → 手机看不到电脑）。
+        //   手动添加的目标 IP 直接放行：那是用户「我确定它在」的明确意图，不该被网段判定挡住。
+        let manual = manualPeers.contains(src)
+        let viaLan = !src.isEmpty && !src.hasPrefix("100.") && (manual || Engine.sameSubnet(src))
         let viaTs  = src.hasPrefix("100.")
 
         // 对方载荷里自报的 100.x（仅用于判断「它还有没有 Tailscale」，不作为通道可用依据）
@@ -342,13 +351,15 @@ final class Engine: ObservableObject {
         syncTargets()
     }
 
-    /// 该 IP 是否与本机任一局域网 IP 同 /24 网段
-    static func sameSubnet(_ ip: String, _ myIPs: [String]) -> Bool {
-        let p = ip.split(separator: ".").map(String.init)
-        guard p.count == 4 else { return false }
-        for my in myIPs where !my.hasPrefix("100.") {
-            let m = my.split(separator: ".").map(String.init)
-            if m.count == 4 && m[0] == p[0] && m[1] == p[1] && m[2] == p[2] { return true }
+    /// 该 IP 是否与本机某个局域网地址处于同一子网（按真实掩码按位与）
+    /// ★ v47.10：不再接收 myIPs 参数、不再比字符串前 3 段。
+    ///   /20 网络（172.28.2.146/20 与 172.28.13.159）以前被判成不同网段，包到了也丢。
+    static func sameSubnet(_ ip: String) -> Bool {
+        guard let v = NetMath.toUInt32(ip) else { return false }
+        for a in RDIP.lans() {
+            guard let mv = NetMath.toUInt32(a.ip), a.prefix > 0, a.prefix < 32 else { continue }
+            let m = NetMath.mask(a.prefix)
+            if (v & m) == (mv & m) { return true }
         }
         return false
     }
@@ -409,14 +420,72 @@ final class Engine: ObservableObject {
         guard !devices.contains(where: { tsAlive($0) }) else { return nil }
         let names = tsOnlinePeers.map { $0.name }.joined(separator: "、")
         return "已发现 \(tsOnlinePeers.count) 台 Tailscale 设备（\(names)），但收不到它们的回应。\n" +
-               "多半是 iPhone 的 Tailscale 关了「允许传入连接」：打开 Tailscale App → 设置 → 允许传入连接，打开即可。"
+               "iOS 永远允许入站（没有「允许传入连接」开关），问题多半在对方：" +
+               "对端若是 Windows，检查防火墙有没有放行 UDP 41234；" +
+               "或看本机 Tailscale App 首页有没有 Warnings（如 MagicSock ReceiveIPv4 not running）。"
     }
     private func syncTargets() {
         var all: [String] = []
         for d in devices { if !d.lanHost.isEmpty { all.append(d.lanHost) }; if !d.tsHost.isEmpty { all.append(d.tsHost) } }
         all.append(contentsOf: tsTargets)   // 跨 Tailscale 拉到的 tailnet 设备 100.x 也作为单播探测目标
         all.append(contentsOf: savedPeers)  // ★ v47.2：上次见过的对端，冷启动时唯一的敲门目标
+        all.append(contentsOf: manualPeers) // ★ v47.10：用户手动加的目标，永远在探测列表里
         discovery.setExtraTargets(all)
+    }
+
+    /// 手动目标是否还没被任何通道证实过（用于列表里显示 ⏳ 等待发现）
+    func isManualPending(_ ip: String) -> Bool {
+        !devices.contains { $0.lanHost == ip || $0.tsHost == ip }
+    }
+
+    /// ★ v47.10：手动添加一个目标 IP
+    ///   校验 → 持久化 → 立刻连轰 6 次（2 秒内必定可见，不用等 2s 周期公告）
+    ///   不按网段过滤：跨网段但三层可路由时也要能用（收包侧同样对 manual 放行）
+    func addManualPeer(_ raw: String) {
+        let ip = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidIPv4(ip) else {
+            addLog("IP 格式不对：\(raw)（要 4 段、每段 0-255，如 192.168.1.5）")
+            return
+        }
+        if RDIP.ips().contains(ip) {
+            addLog("\(ip) 是本机自己的地址，不用添加")
+            return
+        }
+        if manualPeers.contains(ip) {
+            addLog("\(ip) 已在手动清单里")
+            return
+        }
+        manualPeers.append(ip)
+        UserDefaults.standard.set(manualPeers, forKey: Engine.manualKey)
+        syncTargets()
+        burstAnnounce([ip])
+        addLog("已添加手动目标 \(ip)，正在敲门…（对方没开 App / 不在同一网络时会一直显示等待）")
+    }
+
+    /// 移除手动目标（只从手动清单删；对方若仍能广播被发现，会照常出现在列表里）
+    func removeManualPeer(_ ip: String) {
+        manualPeers.removeAll { $0 == ip }
+        UserDefaults.standard.set(manualPeers, forKey: Engine.manualKey)
+        syncTargets()
+        addLog("已移除手动目标 \(ip)")
+    }
+
+    /// 手动目标「等待发现」行被点：立刻再连轰 6 次，不用等 2s 周期公告
+    func knockManualPeer(_ ip: String) {
+        syncTargets()
+        burstAnnounce([ip])
+        addLog("重新敲门 \(ip) …（对方没开 App 或不在同一网络时会一直等待）")
+    }
+
+    /// 严格 IPv4 校验：拒绝 "1"（会被 inet_addr 解析成 0.0.0.1）、拒绝前导 0、拒绝空段
+    func isValidIPv4(_ s: String) -> Bool {
+        let p = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard p.count == 4 else { return false }
+        for seg in p {
+            guard seg.count >= 1, seg.count <= 3, UInt8(seg) != nil else { return false }
+            if seg.count > 1 && seg.first == "0" { return false }   // 010 这类八进制歧义
+        }
+        return true
     }
 
     /// 记住对端地址（供下次冷启动单播敲门）。最多留 8 个，最近用过的排最后。
@@ -1304,6 +1373,8 @@ struct ContentView: View {
     @State var textDraft = ""
     @State var editName = false
     @State var editNameDraft = ""
+    @State var showManual = false       // ★ v47.10：手动添加 IP 的输入面板
+    @State var manualDraft = ""
     @State var showShareInbox = false
     @Environment(\.scenePhase) private var scenePhase
 
@@ -1324,6 +1395,21 @@ struct ContentView: View {
             .navigationTitle("RayDrop锐传")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // ★ v47.10：手动添加目标 IP。广播被路由器/AP 抑制、或跨网段但三层可路由时，
+                //   知道对方 IP 就能直连，不必依赖自动发现。
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        manualDraft = ""
+                        showManual = true
+                    } label: {
+                        Image(systemName: "plus.circle")
+                            .font(.system(size: 17, weight: .semibold))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("手动添加 IP")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     // ★ 单击直达：一下点开系统「文件」App（不再折叠成菜单，少一次点击）。
                     //   必须显式给足点按区域（frame + contentShape）：新版 iOS 把工具栏按钮的可点区域
@@ -1366,6 +1452,14 @@ struct ContentView: View {
             DocPicker { urls in
                 showDoc = false
                 engine.prepareDocuments(urls) { }
+            }
+        }
+        .sheet(isPresented: $showManual) {
+            ManualIpSheet(ip: $manualDraft) { ip in
+                engine.addManualPeer(ip)
+                showManual = false
+            } onCancel: {
+                showManual = false
             }
         }
         .sheet(isPresented: $showText) {
@@ -1467,7 +1561,10 @@ struct ContentView: View {
                 //   已移除「Tailscale · 离线」灰显组：离线设备不再进列表。
                 let lan = engine.devices.filter { engine.lanAlive($0) }
                 let ts = engine.devices.filter { engine.tsAlive($0) }
-                if lan.isEmpty && ts.isEmpty {
+                // ★ v47.10：手动加了但还没被任何通道证实的 IP —— 灰显「等待发现」，
+                //   不假装它在线，但留在这里让你知道「已经加进去了、只是还没回话」。
+                let pendingManual = engine.manualPeers.filter { engine.isManualPending($0) }
+                if lan.isEmpty && ts.isEmpty && pendingManual.isEmpty {
                     Text("正在查找设备…").foregroundColor(.gray).font(.footnote).padding(.horizontal)
                 } else {
                     if !lan.isEmpty {
@@ -1478,11 +1575,43 @@ struct ContentView: View {
                         Text("【Tailscale】").font(.caption2).foregroundColor(.secondary).padding(.horizontal).padding(.top, 4)
                         ForEach(ts) { devRow($0, $0.tsHost) }
                     }
+                    if !pendingManual.isEmpty {
+                        Text("【手动】").font(.caption2).foregroundColor(.secondary).padding(.horizontal).padding(.top, 4)
+                        ForEach(pendingManual, id: \.self) { ip in manualRow(ip) }
+                    }
                 }
             }
             .padding(.vertical, 4)
         }
     }
+    /// 手动目标「等待发现」行：点一下 = 立刻再敲一次门；右侧 ✕ 从手动清单移除
+    /// 不显示为在线设备：没收到回告就不假装它在线，只是让你知道「已经加进去了、还没回话」
+    private func manualRow(_ ip: String) -> some View {
+        HStack(spacing: 6) {
+            Text("⏳").font(.footnote)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(ip).font(.footnote).foregroundColor(.secondary)
+                Text("等待发现 · 点一下重新敲门").font(.caption2).foregroundColor(.secondary)
+            }
+            Spacer(minLength: 4)
+            Button {
+                engine.removeManualPeer(ip)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("移除手动目标 \(ip)")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .onTapGesture { engine.knockManualPeer(ip) }
+    }
+
     private func devRow(_ d: Engine.DeviceInfo, _ host: String) -> some View {
         // ★ 该行正在发送（含「连接中」）：立刻显示转圈并禁用，点下去马上有视觉回应，
         //   也不会被连点成多条并发连接。
@@ -1628,6 +1757,44 @@ struct NameEditSheet: View {
                     ToolbarItem(placement: .cancellationAction) { Button("取消", action: onCancel) }
                     ToolbarItem(placement: .confirmationAction) { Button("保存") { onSave(name) } }
                 }
+        }
+        .navigationViewStyle(.stack)
+        .onAppear { focused = true }
+    }
+}
+
+/// ★ v47.10：手动添加目标 IP。校验最终由 Engine.isValidIPv4 把关，这里只负责输入体验。
+struct ManualIpSheet: View {
+    @Binding var ip: String
+    let onSave: (String) -> Void
+    let onCancel: () -> Void
+    @FocusState var focused: Bool
+
+    var body: some View {
+        NavigationView {
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("对方 IP，如 192.168.1.5", text: $ip)
+                    .keyboardType(.numbersAndPunctuation)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focused)
+                Text("对方开着 App、列表里却看不到时，直接输入它的局域网 IP。添加后立刻单播敲门；对方不在同一网络或没开 App 时会一直显示「等待发现」。")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+            }
+            .padding(14)
+            .navigationTitle("手动添加 IP")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消", action: onCancel) }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("添加") { onSave(ip) }
+                        .disabled(ip.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
         }
         .navigationViewStyle(.stack)
         .onAppear { focused = true }
