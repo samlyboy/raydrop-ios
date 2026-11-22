@@ -1170,7 +1170,10 @@ final class Engine: ObservableObject {
                     self.status = failedList.isEmpty ? "没有选中任何内容" : "读取失败，未加入待发"
                     if !failedList.isEmpty { self.addLog("以下内容读取失败：\(failedList.joined(separator: "、"))") }
                 } else {
-                    self.pendingItems = ok.map { .file($0) }
+                    // ★ v47.14：系统选择器 .default 按相册顺序（旧→新）返回；锐哥要求发送时倒过来，
+                    //   即最新选的先发、旧的后发。只反转成功的项，失败日志的「第 N 项」仍按原始结果编号，
+                    //   避免排查时对不上。滑动多选保持不变。
+                    self.pendingItems = ok.reversed().map { .file($0) }
                     self.pendingSummary = "已选 \(ok.count) 项"
                     if failedList.isEmpty {
                         self.status = "已选 \(ok.count) 项，点下方设备发送"
