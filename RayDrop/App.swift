@@ -1468,7 +1468,8 @@ struct ContentView: View {
         //
         //   系统选择器是相册进程自己渲染的，权限、共享相簿、iCloud 原图、HEVC/ProRes、
         //   连拍、截图全都由系统负责，天然与「照片」App 完全一致，且**不需要任何相册权限**
-        //   （权限问题从根上不存在）。多选时系统自带蓝色数字角标，编号即发送顺序，
+        //   （权限问题从根上不存在）。v47.13 起用 .default 多选：勾选后手指划过即可连续选中，
+        //   和系统「照片」App 一致；结果按相册顺序返回（不再是点选顺序）。
         //   打开就是最新一张（底部），往上滑看更早 —— 之前要的功能它本来就都有。
         .sheet(isPresented: $showPhoto) {
             // 关掉 sheet 不影响加载：providers 由 preparePhotos 捕获持有。
@@ -1974,10 +1975,12 @@ struct PhotoPicker: UIViewControllerRepresentable {
         //   PHPicker 本身不需要相册权限，这里也不会多弹任何授权框。
         var cfg = PHPickerConfiguration(photoLibrary: .shared())
         cfg.selectionLimit = 0; cfg.filter = .any(of: [.images, .videos])
-        // ★ selection = .ordered：角标固定显示「第几个选中」（1/2/3…），
-        //   并且返回数组严格按点选先后排列 —— 编号 = 发送顺序，不再靠猜。
-        //   （不是 .ordered 时角标会变成灰色勾，且顺序按相册排，对不上用户预期）
-        cfg.selection = .ordered
+        // ★ v47.13：selection 从 .ordered 改回 .default —— Apple 官方文档明确写了
+        //   `.ordered` 会 disables swipe to select（带编号角标，只能一个一个点），
+        //   这正是「点一下『选择』后不能滑动快速多选」的根因。
+        //   .default 才是系统「照片」App 的多选体验：勾选 + 手指划过连续多选。
+        //   代价：结果按相册顺序返回、角标是勾不是数字；换来的是原生滑动多选。
+        cfg.selection = .default
         // ★ preferredAssetRepresentationMode = .current：不强制转码，直接用原始文件，
         //   视频能秒取（旧默认 .automatic 会对部分片子走转码，慢且易中途失败）
         cfg.preferredAssetRepresentationMode = .current
