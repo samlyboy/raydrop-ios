@@ -106,13 +106,25 @@ final class ShareViewController: UIViewController
             // loadFileRepresentation / loadItem 给的可能仍是安全作用域 URL；不 startAccessing 会 copy 失败 → -count=0
             let scoped = src.startAccessingSecurityScopedResource()
             defer { if scoped { src.stopAccessingSecurityScopedResource() } }
-            do { try FileManager.default.copyItem(at: src, to: dst); seq.sync { count += 1 } }
+            do {
+                try FileManager.default.copyItem(at: src, to: dst)
+                // ★ v47.16：copyItem 会保留源文件的修改时间 —— 相册视频的 modificationDate
+                //   就是拍摄/导入时间（常是几个月前）。主 APP 的 inbox 残留清理按该时间判断，
+                //   会把刚分享进来的视频当成「1 小时前的残留」直接删掉 → 分享后 0 项。
+                //   写入完成立刻把时间戳刷新成「现在」，彻底切断这条误删链。
+                try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: dst.path)
+                seq.sync { count += 1 }
+            }
             catch { note("复制失败 \(base)：\(error.localizedDescription)") }
         }
         func saveData(_ d: Data, _ typeID: String) {
             let base = "share_" + UUID().uuidString + "." + extOf(typeID)
             let dst = inbox.appendingPathComponent("f_" + base)
-            do { try d.write(to: dst); seq.sync { count += 1 } }
+            do {
+                try d.write(to: dst)
+                try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: dst.path)
+                seq.sync { count += 1 }
+            }
             catch { note("写字节失败 \(base)：\(error.localizedDescription)") }
         }
         func saveText(_ t: String) {

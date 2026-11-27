@@ -1290,12 +1290,23 @@ final class Engine: ObservableObject {
             try? FileManager.default.removeItem(at: diagURL)
         }
 
-        // 1) 清理超过 1 小时的残留（上次崩溃/被杀进程留下的），避免历史文件再冒出来
-        if let olds = try? FileManager.default.contentsOfDirectory(at: inbox, includingPropertiesForKeys: [.contentModificationDateKey]) {
+        // 1) 清理陈旧的崩溃残留（正常文件「读完即删」，这层只兜极端情况）
+        // ★ v47.16 修「分享视频永远变成 0 项」：旧代码按 modificationDate 且阈值仅 1 小时，
+        //   而分享扩展 copyItem 进来的视频会保留**拍摄时间**（常几个月前）→ 刚分享的视频
+        //   一进 inbox 就被当残留删除，files 变空 → 面板显示「没有收到分享内容」= 0 项。
+        //   现在：① 取 modificationDate / creationDate 中较新者（两者都可能被复制保留旧值）；
+        //        ② 阈值放宽到 24 小时；③ 真删了就写日志，下次一眼能定位。
+        if let olds = try? FileManager.default.contentsOfDirectory(at: inbox, includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey]) {
             for old in olds {
-                let age = (try? FileManager.default.attributesOfItem(atPath: old.path)[.modificationDate] as? Date)
-                    .map { Date().timeIntervalSince($0) } ?? 0
-                if age > 3600 { try? FileManager.default.removeItem(at: old) }
+                let attrs = (try? FileManager.default.attributesOfItem(atPath: old.path)) ?? [:]
+                let mod = attrs[.modificationDate] as? Date
+                let cre = attrs[.creationDate] as? Date
+                let newest = [mod, cre].compactMap { $0 }.max() ?? Date()
+                let age = Date().timeIntervalSince(newest)
+                if age > 86400 {
+                    addLog("清理 inbox 陈旧残留：\(old.lastPathComponent)（\(Int(age/3600)) 小时前）")
+                    try? FileManager.default.removeItem(at: old)
+                }
             }
         }
 
