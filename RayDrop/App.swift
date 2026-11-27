@@ -1330,7 +1330,18 @@ final class Engine: ObservableObject {
                 try? FileManager.default.removeItem(at: f)   // 取走即删
             } else {
                 // 文件名格式 "f_<原名>"，还原成发送端的真实名字
-                let real = name.hasPrefix("f_") ? String(name.dropFirst(2)) : name
+                var real = name.hasPrefix("f_") ? String(name.dropFirst(2)) : name
+                // ★ v47.20：分享扩展若没被 TrollStore 替换（仍 v47.15），传来的就是 share_<UUID>.bin。
+                //   这里在主 App 侧按内容还原 IPA 真名，彻底绕开扩展版本问题。
+                //   只在「UUID 占位名」或「.bin 后缀」时才尝试，正常文件名一律原样保留。
+                let isPlaceholder = real.hasPrefix("share_") || (real as NSString).pathExtension.lowercased() == "bin"
+                var restored = false
+                if isPlaceholder, let better = IPAInfo.betterName(for: f) {
+                    addLog("已从文件内容还原文件名：\(real) → \(better)")
+                    real = better
+                    restored = true
+                }
+                _ = restored
                 let attrs = (try? FileManager.default.attributesOfItem(atPath: f.path)) ?? [:]
                 let sz = (attrs[.size] as? NSNumber)?.int64Value ?? 0
                 // 移到临时目录（App Group 容器文件不能长期引用），同时从 inbox 移除。
@@ -1882,9 +1893,13 @@ struct ShareInboxSheet: View {
                 //   只读展示，不影响发送；问题定位后下一版移除。
                 if !engine.shareDiag.isEmpty {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("诊断信息（可截图反馈）").font(.caption2).fontWeight(.semibold).foregroundColor(.orange)
+                        Text("诊断信息（主App v47.20 · 可截图反馈）").font(.caption2).fontWeight(.semibold).foregroundColor(.orange)
                         Text(engine.shareDiag).font(.system(size: 10)).foregroundColor(.secondary)
                             .textSelection(.enabled)
+                        // 若这里显示 v47.15 之类旧版本号 = 分享扩展没被 TrollStore 替换，
+                        // 主 App 侧的 IPAInfo 会兜底还原文件名，不依赖扩展更新。
+                        Text("若下方是旧版本号：分享扩展未更新，已由主App兜底还原文件名")
+                            .font(.system(size: 9)).foregroundColor(.orange.opacity(0.8))
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(8).background(Color.orange.opacity(0.08))

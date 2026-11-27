@@ -459,7 +459,7 @@ final class ShareViewController: UIViewController
         guard let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else { return }
         let f = base.appendingPathComponent("last_share_diag.txt")
         let compact = String(detail.prefix(1400))
-        let text = "v47.19 跳转=\(route) 项=\(count)" + (compact.isEmpty ? "" : " | " + compact)
+        let text = "v47.20 跳转=\(route) 项=\(count)" + (compact.isEmpty ? "" : " | " + compact)
         try? text.write(to: f, atomically: true, encoding: .utf8)
     }
 }
