@@ -1358,7 +1358,6 @@ final class Engine: ObservableObject {
             self.sharedItems = got
             self.showSharePrompt = true
             self.addLog("收到分享内容 \(got.count) 项，请选择设备发送")
-            if !jumpNote.isEmpty { self.addLog("（\(jumpNote)）") }
         }
     }
 
