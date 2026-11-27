@@ -70,9 +70,6 @@ final class Engine: ObservableObject {
     @Published var sharedItems: [SharedItem] = []
     /// 分享扩展唤起 APP 时置 true，主界面弹出选择设备
     @Published var showSharePrompt = false
-    /// ★ v47.19：分享扩展写进来的原始诊断（provider 注册类型/suggestedName/标题），显示在面板顶部，
-    ///   用于定位「分享 IPA 文件名变 UUID.bin」——关键字段一目了然，不用再翻日志猜。
-    @Published var shareDiag = ""
     @Published var receivedFrom = ""
     @Published var receivedText = ""
     @Published var showRecvText = false
@@ -1284,17 +1281,9 @@ final class Engine: ObservableObject {
         guard let dir = Engine.sharedDir else { return }
         let inbox = dir.appendingPathComponent("inbox")
 
-        // ★ v47：读走分享扩展留下的跳转诊断（它用哪条路把 App 拉起来的），读完即删。
-        //   这条信息是排障唯一线索 —— 万一某台手机上「自动跳转」失效，日志里能直接看出来。
-        var jumpNote = ""
+        // 顺手清掉分享扩展可能留下的诊断文件（排障期已过，不再读取展示）
         let diagURL = dir.appendingPathComponent("last_share_diag.txt")
-        if let t = try? String(contentsOf: diagURL, encoding: .utf8) {
-            jumpNote = t.trimmingCharacters(in: .whitespacesAndNewlines)
-            try? FileManager.default.removeItem(at: diagURL)
-            // ★ v47.19：诊断显示到面板顶部（含 provider 注册类型/建议名/标题名），
-            //   实时排障用；诊断从不在面板上出现时说明时序正常。
-            self.shareDiag = jumpNote
-        }
+        try? FileManager.default.removeItem(at: diagURL)
 
         // 1) 清理陈旧的崩溃残留（正常文件「读完即删」，这层只兜极端情况）
         // ★ v47.16 修「分享视频永远变成 0 项」：旧代码按 modificationDate 且阈值仅 1 小时，
@@ -1889,21 +1878,6 @@ struct ShareInboxSheet: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                // ★ v47.19：临时排障条 —— 显示分享扩展拿到的原始字段，定位文件名丢失。
-                //   只读展示，不影响发送；问题定位后下一版移除。
-                if !engine.shareDiag.isEmpty {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("诊断信息（主App v47.20 · 可截图反馈）").font(.caption2).fontWeight(.semibold).foregroundColor(.orange)
-                        Text(engine.shareDiag).font(.system(size: 10)).foregroundColor(.secondary)
-                            .textSelection(.enabled)
-                        // 若这里显示 v47.15 之类旧版本号 = 分享扩展没被 TrollStore 替换，
-                        // 主 App 侧的 IPAInfo 会兜底还原文件名，不依赖扩展更新。
-                        Text("若下方是旧版本号：分享扩展未更新，已由主App兜底还原文件名")
-                            .font(.system(size: 9)).foregroundColor(.orange.opacity(0.8))
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8).background(Color.orange.opacity(0.08))
-                }
                 if engine.sharedItems.isEmpty {
                     Text("没有收到分享内容").foregroundColor(.gray).padding(20)
                 } else {
