@@ -93,15 +93,14 @@ final class ShareViewController: UIViewController
                     return "jpg"
                 }
                 // ★ v47.17：常见文档类型按 conforms 映射，别一律 bin
-                if t.conforms(to: .zipArchive) { return "zip" }
                 if t.conforms(to: .pdf) { return "pdf" }
                 if t.conforms(to: .json) { return "json" }
                 if t.conforms(to: .plainText) { return "txt" }
             }
             // UTType 认不出的具体类型（如 com.apple.itunes.ipa）：从标识符字符串兜底
             let s = typeID.lowercased()
-            if s.contains("ipa") { return "ipa" }
             if s.contains("zip") || s.contains("archive") { return "zip" }
+            if s.contains("ipa") { return "ipa" }
             if s.contains("pdf") { return "pdf" }
             if s.contains("apk") { return "apk" }
             return "bin"
