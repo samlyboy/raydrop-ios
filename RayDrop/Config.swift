@@ -1,9 +1,6 @@
 import Foundation
 
-/// 内嵌的 Tailscale OAuth client 凭据（scope: devices:core:read，只读设备列表）。
-/// 构建时由本地文件提供（已 gitignore，不入库）；CI 通过 GitHub Secrets 注入同名文件。
-/// ⚠️ 此文件含只读凭据，请勿手动提交到公开仓库。
+/// ★ v47.18：Tailscale 发现改为固定网段直探（100.88.88.1-255），
+///   不再需要 OAuth 凭据。此文件保留作占位，勿再放入任何密钥 —— 仓库已公开。
 struct Config {
-    static let TS_CLIENT_ID = "ko41LY8K3y11CNTRL"
-    static let TS_CLIENT_SECRET = "tskey-client-ko41LY8K3y11CNTRL-bn34FHMbsZAno1ZzcKStZAZ3tu1mdjQK"
 }

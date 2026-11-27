@@ -107,9 +107,16 @@ final class ShareViewController: UIViewController
         }
 
         /// 相册分享的视频/图片，临时文件名常没有扩展名；补一个，主 App 的 alignExtension 还会再按文件头纠正
-        func saveURL(_ src: URL, _ typeID: String) {
+        /// ★ v47.18：hint 为分享面板标题里的原文件名，优先于临时 URL 名与 UUID。
+        func saveURL(_ src: URL, _ typeID: String, _ hint: String? = nil) {
             var base = src.lastPathComponent
-            if base.isEmpty || (base as NSString).pathExtension.isEmpty {
+            // 临时名没扩展名 / 是 UUID 占位 / 是系统 cache 名 → 用标题里的原文件名
+            let ext = (base as NSString).pathExtension.lowercased()
+            let looksTemp = base.isEmpty || ext.isEmpty || ext == "tmp" || base.hasPrefix("tmp") ||
+                            base.hasPrefix("share_") || (hint != nil && !base.contains("."))
+            if looksTemp, let h = hint, !h.isEmpty {
+                base = h
+            } else if looksTemp {
                 base = "share_" + UUID().uuidString + "." + extOf(typeID)
             }
             let dst = inbox.appendingPathComponent("f_" + base)
@@ -128,10 +135,11 @@ final class ShareViewController: UIViewController
             }
             catch { note("复制失败 \(base)：\(error.localizedDescription)") }
         }
-        /// ★ v47.17：优先用 provider 自报的 suggestedName（文件分享时就是原文件名），
-        ///   拿不到再退回 share_UUID.扩展名。旧版无条件 UUID 命名 → IPA 变成 share_<UUID>.bin。
-        func saveData(_ d: Data, _ typeID: String, _ suggested: String? = nil) {
+        /// ★ v47.18：文件名来源优先级 provider.suggestedName > 分享面板标题 hint > UUID。
+        ///   旧版无条件 UUID 命名 → IPA 变成 share_<UUID>.bin。
+        func saveData(_ d: Data, _ typeID: String, _ suggested: String? = nil, _ hint: String? = nil) {
             var base = (suggested ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if base.isEmpty || (base as NSString).pathExtension.isEmpty { base = (hint ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
             if base.isEmpty || (base as NSString).pathExtension.isEmpty {
                 base = "share_" + UUID().uuidString + "." + extOf(typeID)
             }
@@ -179,12 +187,12 @@ final class ShareViewController: UIViewController
         }
 
         /// 单个 provider：文件 → item → 字节，逐候选串行回退，任一成功立刻收手（不重复保存）
-        func loadMedia(_ p: NSItemProvider, _ ids: [String], _ done: @escaping () -> Void) {
+        func loadMedia(_ p: NSItemProvider, _ ids: [String], _ hint: String? = nil, _ done: @escaping () -> Void) {
             if ids.isEmpty { done(); return }
             func tryFile(_ i: Int) {
                 if i >= ids.count { tryItem(0); return }
                 p.loadFileRepresentation(forTypeIdentifier: ids[i]) { url, _ in
-                    if let u = url { saveURL(u, ids[i]); done(); return }
+                    if let u = url { saveURL(u, ids[i], hint); done(); return }
                     tryFile(i + 1)
                 }
             }
@@ -192,8 +200,8 @@ final class ShareViewController: UIViewController
                 let sub = Array(ids.prefix(2))
                 if i >= sub.count { tryData(0); return }
                 p.loadItem(forTypeIdentifier: sub[i], options: nil) { obj, _ in
-                    if let u = obj as? URL { saveURL(u, sub[i]); done(); return }
-                    if let d = obj as? Data { saveData(d, sub[i], p.suggestedName); done(); return }
+                    if let u = obj as? URL { saveURL(u, sub[i], hint); done(); return }
+                    if let d = obj as? Data { saveData(d, sub[i], p.suggestedName, hint); done(); return }
                     tryItem(i + 1)
                 }
             }
@@ -204,7 +212,7 @@ final class ShareViewController: UIViewController
                     done(); return
                 }
                 p.loadDataRepresentation(forTypeIdentifier: sub[i]) { d, _ in
-                    if let d { saveData(d, sub[i], p.suggestedName); done(); return }
+                    if let d { saveData(d, sub[i], p.suggestedName, hint); done(); return }
                     tryData(i + 1)
                 }
             }
@@ -216,12 +224,12 @@ final class ShareViewController: UIViewController
         ///   文件类附件一路落到 public.data 的 Data 分支，saveData 只能用 UUID 命名。
         ///   现在优先 fileURL（拿原始 URL = 原始文件名），其次 provider 自报的具体类型，
         ///   文本只在真注册了文本类型时才试，最后的 Data 兜底也带上 suggestedName。
-        func loadOther(_ p: NSItemProvider, _ done: @escaping () -> Void) {
+        func loadOther(_ p: NSItemProvider, _ hint: String? = nil, _ done: @escaping () -> Void) {
             // ① 文件 URL：文件名 + 后缀都在这里，必须最优先
             func tryFileURL() {
                 guard p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { tryTyped(0); return }
                 p.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { obj, _ in
-                    if let u = obj as? URL { saveURL(u, UTType.fileURL.identifier); done(); return }
+                    if let u = obj as? URL { saveURL(u, UTType.fileURL.identifier, hint); done(); return }
                     tryTyped(0)
                 }
             }
@@ -232,11 +240,11 @@ final class ShareViewController: UIViewController
                 }
                 if i >= ids.count { tryText(); return }
                 p.loadFileRepresentation(forTypeIdentifier: ids[i]) { url, _ in
-                    if let u = url { saveURL(u, ids[i]); done(); return }
+                    if let u = url { saveURL(u, ids[i], hint); done(); return }
                     // 具体类型走不通就试 loadItem（有些 provider 只给 Data）
                     p.loadItem(forTypeIdentifier: ids[i], options: nil) { obj, _ in
-                        if let u = obj as? URL { saveURL(u, ids[i]); done(); return }
-                        if let d = obj as? Data { saveData(d, ids[i], p.suggestedName); done(); return }
+                        if let u = obj as? URL { saveURL(u, ids[i], hint); done(); return }
+                        if let d = obj as? Data { saveData(d, ids[i], p.suggestedName, hint); done(); return }
                         tryTyped(i + 1)
                     }
                 }
@@ -258,7 +266,7 @@ final class ShareViewController: UIViewController
             // ④ 最后兜底：public.data，带 suggestedName 保住原名
             func tryRaw() {
                 p.loadDataRepresentation(forTypeIdentifier: UTType.data.identifier) { d, _ in
-                    if let d { saveData(d, UTType.data.identifier, p.suggestedName) }
+                    if let d { saveData(d, UTType.data.identifier, p.suggestedName, hint) }
                     else { note("附件读取失败：\(p.registeredTypeIdentifiers.prefix(6).joined(separator: ","))") }
                     done()
                 }
@@ -268,14 +276,29 @@ final class ShareViewController: UIViewController
 
         for item in items
         {
+            // ★ v47.18：分享面板标题常带原文件名（文件 App / WorkBuddy 分享 IPA 时尤其），
+            //   作为文件名兜底提示传给 saveURL/saveData。只取「像文件名」的一段（含点号且不太长）。
+            let title = item.attributedContentText?.string
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var nameHint: String? = nil
+            if let t = title, t.contains("."), t.count <= 200,
+               !t.contains("\n"), !t.hasPrefix("http") { nameHint = t }
+
             for provider in item.attachments ?? []
             {
+                // 诊断：把每个 provider 的类型与建议名写全，下次一眼看出文件名藏在哪个字段
+                note("注册类型=\(provider.registeredTypeIdentifiers.prefix(8).joined(separator: ","))")
+                if let sn = provider.suggestedName, !sn.isEmpty { note("建议名=\(sn)") }
+                if let nh = nameHint { note("标题名=\(nh)") }
+
                 let ids = mediaCandidates(provider)
                 group.enter()
-                if ids.isEmpty { loadOther(provider) { group.leave() } }
-                else { loadMedia(provider, ids) { group.leave() } }
+                if ids.isEmpty { loadOther(provider, nameHint) { group.leave() } }
+                else { loadMedia(provider, ids, nameHint) { group.leave() } }
             }
-            if let s = item.attributedContentText?.string { saveText(s) }
+            // ★ v47.18：attributedContentText 若是文件名（含扩展名），别再当文本另存一份；
+            //   只有纯文本标题（无扩展名）才走原来的文本保存路径。
+            if let s = title, !s.isEmpty, nameHint == nil { saveText(s) }
         }
 
         // ★ v47.15：视频从 iCloud / 未导出相册导出可能几十秒，原 8s 必然超时 → 放宽到 90s。
@@ -398,7 +421,7 @@ final class ShareViewController: UIViewController
         guard let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else { return }
         let f = base.appendingPathComponent("last_share_diag.txt")
         let compact = String(detail.prefix(500))
-        let text = "v47.15 跳转=\(route) 项=\(count)" + (compact.isEmpty ? "" : " | " + compact)
+        let text = "v47.18 跳转=\(route) 项=\(count)" + (compact.isEmpty ? "" : " | " + compact)
         try? text.write(to: f, atomically: true, encoding: .utf8)
     }
 }
