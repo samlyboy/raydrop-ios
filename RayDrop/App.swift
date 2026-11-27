@@ -342,7 +342,8 @@ final class Engine: ObservableObject {
         for ip in ips where ip.hasPrefix("100.") { peerTS = ip; break }
         if viaTs { peerTS = src }
 
-        let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("code:" + code)
+        // ★ v72：did 缺失时按源 IP 兜底（同网段唯一），不再用 code —— 撞码会两台并成一台
+        let did = (o["did"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? ("ip:" + src)
         let isNew = upsert(id: did, code: code, name: name, platform: platform,
                            src: src, viaLan: viaLan, viaTs: viaTs, peerTSAdvertised: peerTS, port: port)
         // ★ 只在「第一次看到这台设备 / 它刚从离线回来」时回告一次。
@@ -380,7 +381,8 @@ final class Engine: ObservableObject {
     private func upsert(id: String, code: String, name: String, platform: String,
                         src: String, viaLan: Bool, viaTs: Bool, peerTSAdvertised: String, port: UInt16) -> Bool {
         var idx = devices.firstIndex { $0.id == id }
-        if idx == nil { idx = devices.firstIndex { $0.code == code } }
+        // ★ v72：删除旧版「按 code 合并设备」——撞码会把两台真设备并成一行。
+        //   只按 did（上方 id）匹配；did 缺失的极老客户端再用 name+源IP 兜底。
         if idx == nil, viaLan { idx = devices.firstIndex { $0.name == name && $0.lanHost == src } }
         let now = Date()
         if let i = idx {

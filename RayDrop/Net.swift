@@ -480,8 +480,10 @@ final class RDDiscovery {
                    let data = s.data(using: .utf8),
                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let app = obj["app"] as? String, app == RD.app,
-                   let code = obj["code"] as? String, code != RDStore.shared.myCode,
-                   // ★ 再按设备 UUID 过滤一次自己（防止码不同步时自己出现在列表里）
+                   let code = obj["code"] as? String,
+                   // ★ v72 根因修复：只用 deviceId(UUID) 过滤自己，**绝不按 code**。
+                   //   code 是 3 位随机码，两台不同设备撞码很常见；旧版 `code != myCode` 会把
+                   //   撞码的真对端整个丢掉 → 两台 iPhone 互通、唯独撞码那对互相看不见。
                    (obj["did"] as? String).map({ $0 != RDStore.shared.deviceId }) ?? true {
                     // 只有"真对端"的局域网报文才算局域网活着（自己广播的回环不算）
                     if !srcIP.isEmpty && !srcIP.hasPrefix("100.") {
