@@ -77,17 +77,43 @@ final class ShareViewController: UIViewController
 
         // 计数器：等所有 provider 的异步回调都完成再收尾
         let group = DispatchGroup()
-        let lock = NSLock()
         var count = 0
+        var diag: [String] = []
         let seq = DispatchQueue(label: "share.copy")
 
-        func save(_ src: URL) {
-            let base = src.lastPathComponent.isEmpty ? ("share_" + UUID().uuidString) : src.lastPathComponent
+        func note(_ s: String) { seq.sync { diag.append(s) } }
+
+        func extOf(_ typeID: String) -> String {
+            guard let t = UTType(typeID) else { return "bin" }
+            if t.conforms(to: .movie) || t.conforms(to: .video) || t.conforms(to: .audiovisualContent) { return "mov" }
+            if t.conforms(to: .image) {
+                if t.conforms(to: .jpeg) { return "jpg" }
+                if t.conforms(to: .png) { return "png" }
+                if t.conforms(to: .heic) { return "heic" }
+                return "jpg"
+            }
+            return "bin"
+        }
+
+        /// 相册分享的视频/图片，临时文件名常没有扩展名；补一个，主 App 的 alignExtension 还会再按文件头纠正
+        func saveURL(_ src: URL, _ typeID: String) {
+            var base = src.lastPathComponent
+            if base.isEmpty || (base as NSString).pathExtension.isEmpty {
+                base = "share_" + UUID().uuidString + "." + extOf(typeID)
+            }
             let dst = inbox.appendingPathComponent("f_" + base)
             try? FileManager.default.removeItem(at: dst)
-            // loadFileRepresentation 给的 URL 是系统临时文件，回调结束即被删除 → 必须同步复制
-            do { try FileManager.default.copyItem(at: src, to: dst) } catch { return }
-            seq.sync { count += 1 }
+            // loadFileRepresentation / loadItem 给的可能仍是安全作用域 URL；不 startAccessing 会 copy 失败 → -count=0
+            let scoped = src.startAccessingSecurityScopedResource()
+            defer { if scoped { src.stopAccessingSecurityScopedResource() } }
+            do { try FileManager.default.copyItem(at: src, to: dst); seq.sync { count += 1 } }
+            catch { note("复制失败 \(base)：\(error.localizedDescription)") }
+        }
+        func saveData(_ d: Data, _ typeID: String) {
+            let base = "share_" + UUID().uuidString + "." + extOf(typeID)
+            let dst = inbox.appendingPathComponent("f_" + base)
+            do { try d.write(to: dst); seq.sync { count += 1 } }
+            catch { note("写字节失败 \(base)：\(error.localizedDescription)") }
         }
         func saveText(_ t: String) {
             let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -97,68 +123,121 @@ final class ShareViewController: UIViewController
             seq.sync { count += 1 }
         }
 
+        // ★ v47.15：沿用主 App v44 已验证的口径 —— 笼统 public.movie / public.image 常常没注册，
+        //   直接 loadFileRepresentation 会失败（视频/混选时 count=0）。先取 provider 自报的具体类型。
+        let generic: Set<String> = [
+            UTType.item.identifier, UTType.data.identifier, UTType.content.identifier,
+            UTType.movie.identifier, UTType.video.identifier, UTType.audiovisualContent.identifier,
+            UTType.image.identifier, UTType.fileURL.identifier
+        ]
+        func mediaCandidates(_ p: NSItemProvider) -> [String] {
+            var out: [String] = []
+            for id in p.registeredTypeIdentifiers where !generic.contains(id) {
+                guard let t = UTType(id) else { continue }
+                if t.conforms(to: .movie) || t.conforms(to: .video) ||
+                   t.conforms(to: .audiovisualContent) || t.conforms(to: .image) {
+                    if !out.contains(id) { out.append(id) }
+                }
+            }
+            for t in [UTType.quickTimeMovie, .mpeg4Movie, .jpeg, .png, .heic] {
+                let id = t.identifier
+                if !out.contains(id) && p.hasItemConformingToTypeIdentifier(id) { out.append(id) }
+            }
+            for t in [UTType.movie, .video, .audiovisualContent, .image] {
+                let id = t.identifier
+                if !out.contains(id) && p.hasItemConformingToTypeIdentifier(id) { out.append(id) }
+            }
+            return Array(out.prefix(6))
+        }
+
+        /// 单个 provider：文件 → item → 字节，逐候选串行回退，任一成功立刻收手（不重复保存）
+        func loadMedia(_ p: NSItemProvider, _ ids: [String], _ done: @escaping () -> Void) {
+            if ids.isEmpty { done(); return }
+            func tryFile(_ i: Int) {
+                if i >= ids.count { tryItem(0); return }
+                p.loadFileRepresentation(forTypeIdentifier: ids[i]) { url, _ in
+                    if let u = url { saveURL(u, ids[i]); done(); return }
+                    tryFile(i + 1)
+                }
+            }
+            func tryItem(_ i: Int) {
+                let sub = Array(ids.prefix(2))
+                if i >= sub.count { tryData(0); return }
+                p.loadItem(forTypeIdentifier: sub[i], options: nil) { obj, _ in
+                    if let u = obj as? URL { saveURL(u, sub[i]); done(); return }
+                    if let d = obj as? Data { saveData(d, sub[i]); done(); return }
+                    tryItem(i + 1)
+                }
+            }
+            func tryData(_ i: Int) {
+                let sub = Array(ids.prefix(2))
+                if i >= sub.count {
+                    note("媒体读取失败：\(p.registeredTypeIdentifiers.prefix(6).joined(separator: ","))")
+                    done(); return
+                }
+                p.loadDataRepresentation(forTypeIdentifier: sub[i]) { d, _ in
+                    if let d { saveData(d, sub[i]); done(); return }
+                    tryData(i + 1)
+                }
+            }
+            tryFile(0)
+        }
+
+        /// 非媒体（文本 / 未知类型）：文本两种 API → public.data 兜底
+        func loadOther(_ p: NSItemProvider, _ done: @escaping () -> Void) {
+            let textIDs = [UTType.plainText.identifier, UTType.text.identifier] +
+                          p.registeredTypeIdentifiers.filter { $0 != UTType.fileURL.identifier }
+            func tryText(_ i: Int) {
+                if i >= textIDs.count { tryRaw(); return }
+                p.loadItem(forTypeIdentifier: textIDs[i], options: nil) { obj, _ in
+                    if let s = obj as? String { saveText(s); done(); return }
+                    if let d = obj as? Data, let s = String(data: d, encoding: .utf8) {
+                        saveText(s); done(); return
+                    }
+                    tryText(i + 1)
+                }
+            }
+            func tryRaw() {
+                p.loadDataRepresentation(forTypeIdentifier: UTType.data.identifier) { d, _ in
+                    if let d { saveData(d, UTType.data.identifier) }
+                    else { note("附件读取失败：\(p.registeredTypeIdentifiers.prefix(6).joined(separator: ","))") }
+                    done()
+                }
+            }
+            tryText(0)
+        }
+
         for item in items
         {
             for provider in item.attachments ?? []
             {
-                if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-                {
-                    group.enter()
-                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { obj, _ in
-                        defer { group.leave() }
-                        if let u = obj as? URL { save(u) }
-                    }
-                }
-                // 图片/视频：用具体的 image / movie 类型注册，UTType.item 在相册分享时匹配不到
-                else if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier)
-                {
-                    group.enter()
-                    provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
-                        defer { group.leave() }
-                        if let url { save(url) }
-                    }
-                }
-                else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier)
-                {
-                    group.enter()
-                    provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { url, _ in
-                        defer { group.leave() }
-                        if let url { save(url) }
-                    }
-                }
-                else if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
-                {
-                    group.enter()
-                    provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { obj, _ in
-                        defer { group.leave() }
-                        if let s = obj as? String { saveText(s) }
-                    }
-                }
-                else
-                {
-                    // 兜底：任何 public.data 类附件
-                    group.enter()
-                    provider.loadFileRepresentation(forTypeIdentifier: UTType.data.identifier) { url, _ in
-                        defer { group.leave() }
-                        if let url { save(url) }
-                    }
-                }
+                let ids = mediaCandidates(provider)
+                group.enter()
+                if ids.isEmpty { loadOther(provider) { group.leave() } }
+                else { loadMedia(provider, ids) { group.leave() } }
             }
             if let s = item.attributedContentText?.string { saveText(s) }
         }
 
-        // 等所有异步回调（最多 8 秒）
-        let deadline = DispatchTime.now() + 8
+        // ★ v47.15：视频从 iCloud / 未导出相册导出可能几十秒，原 8s 必然超时 → 放宽到 90s。
+        //   图片/文本通常在数秒内完成，届时 group 就绪会提前收尾，不会白等。
         DispatchQueue.global().async {
+            let deadline = DispatchTime.now() + 90
+            var toldSlow = false
             while group.wait(timeout: .now()) == .timedOut && DispatchTime.now() < deadline {
+                if !toldSlow && DispatchTime.now() > deadline - 85 {
+                    toldSlow = true
+                    DispatchQueue.main.async { self.statusLabel.text = "视频导出较慢，请稍候…" }
+                }
                 usleep(50_000)
             }
             let n = seq.sync { count }
-            DispatchQueue.main.async { self.finish(n) }
+            let d = seq.sync { diag.prefix(4).joined(separator: " | ") }
+            DispatchQueue.main.async { self.finish(n, d) }
         }
     }
 
-    func finish(_ count: Int)
+    func finish(_ count: Int, _ detail: String = "")
     {
         if count == 0
         {
@@ -178,7 +257,7 @@ final class ShareViewController: UIViewController
 
         let route = jumpToHostApp()
         statusLabel.text = "已准备 \(count) 项，正在打开 RayDrop…"
-        writeDiag(route: route, count: count)
+        writeDiag(route: route, count: count, detail: detail)
         scheduleReadyNotification(count)
 
         // 留 0.35s 让跳转指令生效，再收掉分享面板（顺序反了会被系统把跳转吞掉）
@@ -255,11 +334,12 @@ final class ShareViewController: UIViewController
     }
 
     /// 把本次跳转结果写到 App Group，主 APP 读走后会删掉并打进日志
-    private func writeDiag(route: String, count: Int)
+    private func writeDiag(route: String, count: Int, detail: String)
     {
         guard let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else { return }
         let f = base.appendingPathComponent("last_share_diag.txt")
-        let text = "v47 跳转=\(route) 项=\(count)"
+        let compact = String(detail.prefix(500))
+        let text = "v47.15 跳转=\(route) 项=\(count)" + (compact.isEmpty ? "" : " | " + compact)
         try? text.write(to: f, atomically: true, encoding: .utf8)
     }
 }
