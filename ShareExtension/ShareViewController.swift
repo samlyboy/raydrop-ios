@@ -84,14 +84,26 @@ final class ShareViewController: UIViewController
         func note(_ s: String) { seq.sync { diag.append(s) } }
 
         func extOf(_ typeID: String) -> String {
-            guard let t = UTType(typeID) else { return "bin" }
-            if t.conforms(to: .movie) || t.conforms(to: .video) || t.conforms(to: .audiovisualContent) { return "mov" }
-            if t.conforms(to: .image) {
-                if t.conforms(to: .jpeg) { return "jpg" }
-                if t.conforms(to: .png) { return "png" }
-                if t.conforms(to: .heic) { return "heic" }
-                return "jpg"
+            if let t = UTType(typeID) {
+                if t.conforms(to: .movie) || t.conforms(to: .video) || t.conforms(to: .audiovisualContent) { return "mov" }
+                if t.conforms(to: .image) {
+                    if t.conforms(to: .jpeg) { return "jpg" }
+                    if t.conforms(to: .png) { return "png" }
+                    if t.conforms(to: .heic) { return "heic" }
+                    return "jpg"
+                }
+                // ★ v47.17：常见文档类型按 conforms 映射，别一律 bin
+                if t.conforms(to: .zipArchive) { return "zip" }
+                if t.conforms(to: .pdf) { return "pdf" }
+                if t.conforms(to: .json) { return "json" }
+                if t.conforms(to: .plainText) { return "txt" }
             }
+            // UTType 认不出的具体类型（如 com.apple.itunes.ipa）：从标识符字符串兜底
+            let s = typeID.lowercased()
+            if s.contains("ipa") { return "ipa" }
+            if s.contains("zip") || s.contains("archive") { return "zip" }
+            if s.contains("pdf") { return "pdf" }
+            if s.contains("apk") { return "apk" }
             return "bin"
         }
 
@@ -117,8 +129,13 @@ final class ShareViewController: UIViewController
             }
             catch { note("复制失败 \(base)：\(error.localizedDescription)") }
         }
-        func saveData(_ d: Data, _ typeID: String) {
-            let base = "share_" + UUID().uuidString + "." + extOf(typeID)
+        /// ★ v47.17：优先用 provider 自报的 suggestedName（文件分享时就是原文件名），
+        ///   拿不到再退回 share_UUID.扩展名。旧版无条件 UUID 命名 → IPA 变成 share_<UUID>.bin。
+        func saveData(_ d: Data, _ typeID: String, _ suggested: String? = nil) {
+            var base = (suggested ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if base.isEmpty || (base as NSString).pathExtension.isEmpty {
+                base = "share_" + UUID().uuidString + "." + extOf(typeID)
+            }
             let dst = inbox.appendingPathComponent("f_" + base)
             do {
                 try d.write(to: dst)
@@ -177,7 +194,7 @@ final class ShareViewController: UIViewController
                 if i >= sub.count { tryData(0); return }
                 p.loadItem(forTypeIdentifier: sub[i], options: nil) { obj, _ in
                     if let u = obj as? URL { saveURL(u, sub[i]); done(); return }
-                    if let d = obj as? Data { saveData(d, sub[i]); done(); return }
+                    if let d = obj as? Data { saveData(d, sub[i], p.suggestedName); done(); return }
                     tryItem(i + 1)
                 }
             }
@@ -188,35 +205,66 @@ final class ShareViewController: UIViewController
                     done(); return
                 }
                 p.loadDataRepresentation(forTypeIdentifier: sub[i]) { d, _ in
-                    if let d { saveData(d, sub[i]); done(); return }
+                    if let d { saveData(d, sub[i], p.suggestedName); done(); return }
                     tryData(i + 1)
                 }
             }
             tryFile(0)
         }
 
-        /// 非媒体（文本 / 未知类型）：文本两种 API → public.data 兜底
+        /// 非媒体（文件 / 文本 / 未知类型）
+        /// ★ v47.17 修「分享 IPA 文件名变 share_<UUID>.bin」：旧版把 fileURL 从候选里排除，
+        ///   文件类附件一路落到 public.data 的 Data 分支，saveData 只能用 UUID 命名。
+        ///   现在优先 fileURL（拿原始 URL = 原始文件名），其次 provider 自报的具体类型，
+        ///   文本只在真注册了文本类型时才试，最后的 Data 兜底也带上 suggestedName。
         func loadOther(_ p: NSItemProvider, _ done: @escaping () -> Void) {
-            let textIDs = [UTType.plainText.identifier, UTType.text.identifier] +
-                          p.registeredTypeIdentifiers.filter { $0 != UTType.fileURL.identifier }
-            func tryText(_ i: Int) {
-                if i >= textIDs.count { tryRaw(); return }
-                p.loadItem(forTypeIdentifier: textIDs[i], options: nil) { obj, _ in
+            // ① 文件 URL：文件名 + 后缀都在这里，必须最优先
+            func tryFileURL() {
+                guard p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { tryTyped(0); return }
+                p.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { obj, _ in
+                    if let u = obj as? URL { saveURL(u, UTType.fileURL.identifier); done(); return }
+                    tryTyped(0)
+                }
+            }
+            // ② provider 自报的具体非媒体类型（com.apple.itunes.ipa / zip / pdf…）
+            func tryTyped(_ i: Int) {
+                let ids = p.registeredTypeIdentifiers.filter {
+                    $0 != UTType.fileURL.identifier && $0 != UTType.data.identifier && $0 != UTType.item.identifier
+                }
+                if i >= ids.count { tryText(); return }
+                p.loadFileRepresentation(forTypeIdentifier: ids[i]) { url, _ in
+                    if let u = url { saveURL(u, ids[i]); done(); return }
+                    // 具体类型走不通就试 loadItem（有些 provider 只给 Data）
+                    p.loadItem(forTypeIdentifier: ids[i], options: nil) { obj, _ in
+                        if let u = obj as? URL { saveURL(u, ids[i]); done(); return }
+                        if let d = obj as? Data { saveData(d, ids[i], p.suggestedName); done(); return }
+                        tryTyped(i + 1)
+                    }
+                }
+            }
+            // ③ 真文本：仅当注册了文本类型才试，避免把二进制误当 UTF-8 文本
+            func tryText() {
+                let tid = p.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
+                    ? UTType.plainText.identifier
+                    : (p.hasItemConformingToTypeIdentifier(UTType.text.identifier) ? UTType.text.identifier : "")
+                guard !tid.isEmpty else { tryRaw(); return }
+                p.loadItem(forTypeIdentifier: tid, options: nil) { obj, _ in
                     if let s = obj as? String { saveText(s); done(); return }
                     if let d = obj as? Data, let s = String(data: d, encoding: .utf8) {
                         saveText(s); done(); return
                     }
-                    tryText(i + 1)
+                    tryRaw()
                 }
             }
+            // ④ 最后兜底：public.data，带 suggestedName 保住原名
             func tryRaw() {
                 p.loadDataRepresentation(forTypeIdentifier: UTType.data.identifier) { d, _ in
-                    if let d { saveData(d, UTType.data.identifier) }
+                    if let d { saveData(d, UTType.data.identifier, p.suggestedName) }
                     else { note("附件读取失败：\(p.registeredTypeIdentifiers.prefix(6).joined(separator: ","))") }
                     done()
                 }
             }
-            tryText(0)
+            tryFileURL()
         }
 
         for item in items
