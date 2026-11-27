@@ -143,6 +143,19 @@ final class ShareViewController: UIViewController
             if base.isEmpty || (base as NSString).pathExtension.isEmpty {
                 base = "share_" + UUID().uuidString + "." + extOf(typeID)
             }
+            // ★ v47.19：所有名字来源都失败时，至少按文件内容嗅探出正确后缀，别一律 .bin。
+            //   IPA / zip / apk 都是 PK(50 4B) 开头的 zip 容器；PDF 是 %PDF。
+            if !base.hasSuffix("." + extOf(typeID)) && extOf(typeID) == "bin" {
+                let b = [UInt8](d.prefix(8))
+                if b.count >= 4, b[0] == 0x50, b[1] == 0x4B {
+                    // zip 容器：从字节里找 Payload/ 判断是 IPA，否则 zip
+                    let head = String(data: d.prefix(2048), encoding: .ascii) ?? ""
+                    base = (base as NSString).deletingPathExtension + (head.contains("Payload/") ? ".ipa" : ".zip")
+                } else if b.count >= 4, b[0] == 0x25, b[1] == 0x50, b[2] == 0x44, b[3] == 0x46 {
+                    base = (base as NSString).deletingPathExtension + ".pdf"
+                }
+            }
+            note("saveData 命名=\(base) suggested=\(suggested ?? "nil") hint=\(hint ?? "nil")")
             let dst = inbox.appendingPathComponent("f_" + base)
             do {
                 try d.write(to: dst)
@@ -226,10 +239,14 @@ final class ShareViewController: UIViewController
         ///   文本只在真注册了文本类型时才试，最后的 Data 兜底也带上 suggestedName。
         func loadOther(_ p: NSItemProvider, _ hint: String? = nil, _ done: @escaping () -> Void) {
             // ① 文件 URL：文件名 + 后缀都在这里，必须最优先
+            // ★ v47.19：去掉 hasItemConformingTo(fileURL) 前置门槛。
+            //   WorkBuddy 等 App 分享文件时只注册 public.data、不声明 fileURL，
+            //   但 loadItem(forTypeIdentifier: fileURL) 实际仍能返回带原名的 URL。
+            //   旧版被 guard 直接跳过 → 一路落到 public.data → saveData 用 UUID 命名 → IPA 变 share_UUID.bin。
             func tryFileURL() {
-                guard p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { tryTyped(0); return }
                 p.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { obj, _ in
-                    if let u = obj as? URL { saveURL(u, UTType.fileURL.identifier, hint); done(); return }
+                    if let u = obj as? URL { note("fileURL 命中=\(u.lastPathComponent)"); saveURL(u, UTType.fileURL.identifier, hint); done(); return }
+                    note("fileURL 未命中")
                     tryTyped(0)
                 }
             }
@@ -238,7 +255,7 @@ final class ShareViewController: UIViewController
                 let ids = p.registeredTypeIdentifiers.filter {
                     $0 != UTType.fileURL.identifier && $0 != UTType.data.identifier && $0 != UTType.item.identifier
                 }
-                if i >= ids.count { tryText(); return }
+                if i >= ids.count { tryGenericFile(0); return }
                 p.loadFileRepresentation(forTypeIdentifier: ids[i]) { url, _ in
                     if let u = url { saveURL(u, ids[i], hint); done(); return }
                     // 具体类型走不通就试 loadItem（有些 provider 只给 Data）
@@ -249,7 +266,21 @@ final class ShareViewController: UIViewController
                     }
                 }
             }
-            // ③ 真文本：仅当注册了文本类型才试，避免把二进制误当 UTF-8 文本
+            // ③ 通用 item/data 的文件表示：即使 provider 只注册 public.data，
+            //   loadFileRepresentation 常仍返回带原文件名的临时 URL —— 这是 UUID 命名前的最后一道抢救。
+            //   ★ v47.19：IPA 变 share_UUID.bin 就是漏了这一跳：ids 被过滤空 → 直接掉到 tryRaw(Data)。
+            func tryGenericFile(_ i: Int) {
+                let ids = [UTType.item.identifier, UTType.data.identifier]
+                if i >= ids.count { tryText(); return }
+                p.loadFileRepresentation(forTypeIdentifier: ids[i]) { url, _ in
+                    if let u = url {
+                        note("通用文件表示命中 \(ids[i])=\(u.lastPathComponent)")
+                        saveURL(u, ids[i], hint); done(); return
+                    }
+                    tryGenericFile(i + 1)
+                }
+            }
+            // ④ 真文本：仅当注册了文本类型才试，避免把二进制误当 UTF-8 文本
             func tryText() {
                 let tid = p.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
                     ? UTType.plainText.identifier
@@ -280,8 +311,9 @@ final class ShareViewController: UIViewController
             //   作为文件名兜底提示传给 saveURL/saveData。只取「像文件名」的一段（含点号且不太长）。
             let title = item.attributedContentText?.string
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            note("标题原文=\(title ?? "nil")")
             var nameHint: String? = nil
-            if let t = title, t.contains("."), t.count <= 200,
+            if let t = title, t.contains("."), t.count <= 300,
                !t.contains("\n"), !t.hasPrefix("http") { nameHint = t }
 
             for provider in item.attachments ?? []
@@ -314,7 +346,8 @@ final class ShareViewController: UIViewController
                 usleep(50_000)
             }
             let n = seq.sync { count }
-            let d = seq.sync { diag.prefix(4).joined(separator: " | ") }
+            // ★ v47.19：诊断取全部字段（旧版只取前 4 条，关键的 saveData 命名/建议名被截掉了）
+            let d = seq.sync { diag.prefix(16).joined(separator: " | ") }
             DispatchQueue.main.async { self.finish(n, d) }
         }
     }
@@ -337,6 +370,11 @@ final class ShareViewController: UIViewController
             CFNotificationName("com.raydrop.ios.sharedItemsAdded" as CFString),
             nil, nil, true)
 
+        // ★ v47.19：诊断必须先落地、再拉起主 APP。
+        //   旧版顺序相反：jumpToHostApp() 一调用，主 APP 立刻起来读走 last_share_diag.txt，
+        //   此时扩展还没写 → 主 APP 读到空/旧内容 → 三版诊断全部石沉大海。
+        //   先写 route="?" 占位，跳转后若还能补写再更新；关键是让文件名诊断先可读。
+        writeDiag(route: "pending", count: count, detail: detail)
         let route = jumpToHostApp()
         statusLabel.text = "已准备 \(count) 项，正在打开 RayDrop…"
         writeDiag(route: route, count: count, detail: detail)
@@ -420,8 +458,8 @@ final class ShareViewController: UIViewController
     {
         guard let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else { return }
         let f = base.appendingPathComponent("last_share_diag.txt")
-        let compact = String(detail.prefix(500))
-        let text = "v47.18 跳转=\(route) 项=\(count)" + (compact.isEmpty ? "" : " | " + compact)
+        let compact = String(detail.prefix(1400))
+        let text = "v47.19 跳转=\(route) 项=\(count)" + (compact.isEmpty ? "" : " | " + compact)
         try? text.write(to: f, atomically: true, encoding: .utf8)
     }
 }
